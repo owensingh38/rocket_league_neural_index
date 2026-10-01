@@ -5,7 +5,7 @@
 Given high-resolution information on the position of a Rocket League replay frame in play that occurs in between goals, how accurately can we identify its "latent goal-probability state"; that is, the underlying probabilities of one or neither team scoring within some period of time that describe the current "momentum" of the game.
 
 Training Data: 
-Rocket League replays collected from the following seasons and parsed with the AnalyzeRL Boxcars library:
+Rocket League replays collected from the following seasons and parsed with the [AnalyzeRL Boxcars library](https://pypi.org/project/analyzerl-boxcars):
 - 2021-22
 - 2022-23
 - 2024
@@ -153,3 +153,7 @@ with torch.inference_mode():
 
 probabilities = collapse_probabilities(logits.softmax(-1), model_config.targets_per_team).cpu().numpy()
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
