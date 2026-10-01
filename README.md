@@ -156,4 +156,4 @@ probabilities = collapse_probabilities(logits.softmax(-1), model_config.targets_
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0. See [LICENSE](LICENSE).
