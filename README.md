@@ -169,91 +169,28 @@ LGPSTransformer(
 
 ### Example Inference
 
-LGPS training now includes future ball and player states at configurable sample-frame
-offsets and the next touch player and time. The default offsets `(10, 30, 60, 100)`
-correspond to 1, 3, 6, and 10 seconds at the default 10 Hz sample rate. Set
-`LGPSModelConfig(sample_rate=..., future_frames=[...])` to choose another rate or
-set of offsets, and prepare source replays with the same `target_sample_rate`.
-The source Parquet must contain `frame_touch_player_slot`; existing prepared
-Parquet files need to be regenerated with `lgps.dataset.prepare_dataset`.
-Training combines the goal and auxiliary losses with gradient balancing; validation
-and test losses remain goal-only. `infer_lgps(..., include_aux=True)` adds decoded
-future ball and player states at each trained offset, plus next-touch player and
-timing predictions, while preserving the goal probability columns. The original
-PyTorch checkpoint with auxiliary weights is required; TorchScript exports are
-goal-only. These are direct horizon predictions from each input frame, not an
-autoregressive rollout.
-
 ```python
-from inference.rlni_inference import infer_lgps
-
-predictions = infer_lgps(
-    "data/frames",
-    checkpoint="results/lgps/lgps_transformer.pt",
-    include_aux=True,
-)
-```
-
-Auxiliary output columns use `predicted_ball_{offset}_{feature}` and
-`predicted_player_{slot}_{offset}_{feature}`. The offset is in sampled frames
-(10, 30, 60, or 100 by default); player slots follow the dataset's canonical
-blue-then-orange ordering. Next-touch output includes the selected canonical
-slot, its probability and predicted time in seconds, and per-slot probability
-and time columns. The original head values are retained in companion
-`*_head_{feature}` columns; for player binary features, inference also returns
-per-feature probability columns. Decoded quaternion outputs are normalized and
-binary state columns are thresholded, so use the head and probability columns
-when those details matter. Per-player next-touch logits are also included. This
-makes the heads available for trajectory experiments; state predictions at an
-offset can be inspected or used as inputs to a separate rollout procedure.
-
-```python
-import torch
 from analyzerl_boxcars import parse_replay
-from lgps.dataset import EntityTokenizer, prepare_replay
-from lgps.model import LGPSTransformer, load_lgps_weights
-from lgps.config import LGPSModelConfig
-from lgps.targets import collapse_probabilities
 
-REPLAY = "/kaggle/input/replay/game.replay"
-CHECKPOINT = "/kaggle/input/lgps-model/lgps_transformer.pt"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+REPLAY, CHECKPOINT, device = "/kaggle/input/replay/game.replay", "/kaggle/input/lgps-model/lgps_transformer.pt", torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 frames = parse_replay(REPLAY, event_tagging=False)
+
 checkpoint = torch.load(CHECKPOINT, map_location=device, weights_only=False)
 
 model_config = LGPSModelConfig(**checkpoint["model_config"])
-frames = prepare_replay(frames, random_augmentation=False,
-                        target_sample_rate=model_config.sample_rate, inference=True)
-model = LGPSTransformer(config=model_config).to(device).eval()
+model = create_model(model_config, train_config).to(device).eval(); 
 
-state_dict = {
-    key.removeprefix("_orig_mod."): value
-    for key, value in checkpoint["model_state_dict"].items()
-}
-load_lgps_weights(model, state_dict)
+model.load_state_dict({k.removeprefix("_orig_mod."): v for k, v in 
+checkpoint["model_state_dict"].items()})
 
-tokenizer = EntityTokenizer(model_entities=model_config.model_entities)
-batch = {
-    key: value.to(device)
-    for key, value in tokenizer(frames).items()
-}
+batch = {key: value.to(device) for key, value in 
+EntityTokenizer(model_entities=model_config.model_entities)(frames).items()}
 
 with torch.inference_mode():
-    logits = model(
-        batch["ball"],
-        batch["players"],
-        batch["goals"],
-        batch["entity_types"],
-        batch["entity_teams"],
-        batch["game_context"],
-        batch.get("big_boosts"),
-        batch.get("small_boosts"),
-    )
+    logits = model(batch["ball"], batch["players"], batch["goals"], batch["entity_types"], batch["entity_teams"], batch["game_context"], batch.get("big_boosts"), batch.get("small_boosts"))
 
-probabilities = collapse_probabilities(
-    logits.softmax(dim=-1), model_config.targets_per_team
-).cpu().numpy()
+probabilities = collapse_probabilities(logits.softmax(-1), model_config.targets_per_team).cpu().numpy()
 ```
 
 ### Example In-Game Probabilities
