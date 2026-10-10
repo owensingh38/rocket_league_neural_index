@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import io
 import math
 import tarfile
@@ -16,29 +17,63 @@ from props import (
     BOOST_COLUMNS,
     BOOST_ENTITY_GROUPS,
     BOOST_FEATURES,
-    BOOST_POSITIONS,
     CONTEXT_FEATURES,
     GOAL_COLUMNS,
     GOAL_FEATURES,
-    GOAL_STATE_COLUMNS,
     MAX_PLAYERS_PER_TEAM,
     ORANGE_GOAL,
     PLAYER_FEATURES,
     PLAYER_SLOTS,
     SMALL_BOOST_COLUMNS,
-    build_frame_batch,
     normalize_model_entities,
 )
+from .targets import build_frame_batch
+from .aux_tasks import LGPSBallStateAux, LGPSNextTouchAux, LGPSPlayerStateAux
+
+GOAL_STATE_COLUMNS = (
+    "blue_goal_in_next_ten_seconds",
+    "orange_goal_in_next_ten_seconds",
+    "neither_goal_in_next_ten_seconds",
+)
+BOOST_POSITIONS = np.asarray([
+    (-3072,-4096),(3072,-4096),(-3584,0),(3584,0),(-3072,4096),(3072,4096),
+    (-1792,-4184),(0,-4240),(1792,-4184),(-940,-3308),(940,-3308),(0,-2816),
+    (-3584,-2484),(-1788,-2300),(1788,-2300),(3584,-2484),(-2048,-1036),(0,-1024),(2048,-1036),
+    (-1024,0),(1024,0),(-2048,1036),(0,1024),(2048,1036),(-3584,2484),(-1788,2300),(1788,2300),
+    (3584,2484),(0,2816),(-940,3308),(940,3308),(-1792,4184),(0,4240),(1792,4184),
+], dtype=np.float32)
 
 TARGET_SAMPLE_RATE = 10.0
 SOURCE_HZ = 30.0
 RECORD_BATCH_ROWS = 65_536
 WRITE_BATCH_ROWS = 131_072
+EVENT_FLAG_COLUMNS = ('kickoff_in_progress', 'goal_in_progress')
 
 OUTPUT_COLUMNS = (
-    'replay_id', '_window_id', '_source_time', 'time_until_next_goal', *GOAL_STATE_COLUMNS, *CONTEXT_FEATURES, *BALL_FEATURES,
-    *(field for slot in PLAYER_SLOTS for field in (f'player_{slot}_team_id', *(f'player_{slot}_{feature}' for feature in PLAYER_FEATURES))),
-    *GOAL_COLUMNS, *BOOST_COLUMNS, 'random_augmentation',
+    'replay_id',
+    '_window_id',
+    '_source_time',
+    '_touching_ball_slot',
+    '_is_touching_ball',
+    '_next_touch_slot',
+    '_next_touch_seconds',
+    'time_until_next_goal',
+    *GOAL_STATE_COLUMNS,
+    *CONTEXT_FEATURES,
+    *BALL_FEATURES,
+    *(
+        field
+        for slot in PLAYER_SLOTS
+        for field in (
+            f'player_{slot}_team_id',
+            *(f'player_{slot}_{feature}' for feature in PLAYER_FEATURES),
+            f'player_{slot}_touching_ball',
+        )
+    ),
+    *GOAL_COLUMNS,
+    *BOOST_COLUMNS,
+    *EVENT_FLAG_COLUMNS,
+    'random_augmentation',
 )
 
 def split_for_source(source_name: str) -> str:
@@ -47,7 +82,7 @@ def split_for_source(source_name: str) -> str:
 
 
 def iter_parquets(root: Path):
-    # Open one archive member (or unpacked Parquet) at a time.
+    # Iterate through Parquet files and archive members one at a time.
     root = Path(root)
     if root.is_file():
         paths = (root,)
@@ -56,11 +91,14 @@ def iter_parquets(root: Path):
                              and path.suffix.lower() in ('.parquet', '.tar')))
     else:
         raise FileNotFoundError(f'LGPS source does not exist: {root}')
+
     if not paths:
         raise FileNotFoundError(f'No replay Parquet files or archives under: {root}')
+
     for path in paths:
         if path.suffix.lower() == '.parquet':
             yield str(path), pq.ParquetFile(path)
+
         elif path.suffix.lower() == '.tar':
             with tarfile.open(path, 'r:') as bundle:
                 for member in bundle:
@@ -78,13 +116,18 @@ PLAYER_CORE_FEATURES = (
 
 def source_player_slots(available):
     # Return physical source slots, excluding metadata-only ghost slots.
+
     slots = sorted({
         int(name.split('_')[1]) for name in available
         if name.startswith('player_') and name.endswith('_team_id') and name.split('_')[1].isdigit()
     })
+
     return tuple(
         slot for slot in slots
-        if {f'player_{slot}_{feature}' for feature in ('team_id', 'on_field', 'demoed', *PLAYER_CORE_FEATURES)}.issubset(available)
+        if {
+            f'player_{slot}_{feature}'
+            for feature in ('team_id', 'on_field', 'demoed', *PLAYER_CORE_FEATURES)
+        }.issubset(available)
     )
 
 
@@ -94,23 +137,37 @@ def selected_source_columns(available):
         'replay_id', 'frame_number', 'frame_delta', 'frame_seconds_elapsed', 'frame_is_active', 'stint_id',
         'blue_team_score', 'orange_team_score', *BALL_FEATURES,
     }
+
     missing = required.difference(available)
     if missing:
         raise ValueError(f'missing required source columns: {sorted(missing)}')
+
     slots = source_player_slots(available)
+
     if not slots:
         raise ValueError('no physical player slots with complete position, velocity, and rotation fields')
+
     player_columns = {
         f'player_{slot}_{feature}'
         for slot in slots
         for feature in ('team_id', *(feature for feature in PLAYER_FEATURES if feature != 'respawn_timer'))
         if f'player_{slot}_{feature}' in available
     }
+    player_columns.update(
+        f'player_{slot}_{feature}'
+        for slot in slots
+        for feature in ('touching_ball', 'is_touching_ball')
+        if f'player_{slot}_{feature}' in available
+    )
+
     optional = {
-        name for name in ('goal_event_id', 'goal_event_team_id', 'blue_next_goal', 'orange_next_goal')
+        name for name in ('goal_event_id', 'goal_event_team_id', 'blue_next_goal', 'orange_next_goal',
+                          *EVENT_FLAG_COLUMNS)
         if name in available
     }
+
     boosts = {name for name in available if name.startswith('boost_pickup_')}
+
     return sorted(required | player_columns | optional | boosts)
 
 
@@ -137,41 +194,46 @@ def iter_replays(parquet, columns):
 
 def numeric(frame, column, default=0.0):
     # Return a writable float32 array; replay batches can expose read-only Arrow views.
+
     if column not in frame.columns:
         return np.full(frame.height, default, dtype=np.float32)
+
     return frame[column].cast(pl.Float32, strict=False).fill_null(default).to_numpy().astype(np.float32, copy=True)
 
 
 def goal_rows_and_teams(frame):
     # Use native goal events, or score increments when historical fields are absent.
-    count = frame.height
     if {'goal_event_id', 'goal_event_team_id'}.issubset(frame.columns):
         event_ids = frame['goal_event_id'].cast(pl.String, strict=False).fill_null('').to_numpy()
         teams = frame['goal_event_team_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
         rows = (event_ids != '') & np.isin(teams, (0, 1))
         rows[1:] &= (event_ids[1:] != event_ids[:-1]) | ~rows[:-1]
+
         return rows, teams.astype(np.int8, copy=False)
+
     blue = numeric(frame, 'blue_team_score', np.nan)
     orange = numeric(frame, 'orange_team_score', np.nan)
     blue_scored = np.r_[False, np.diff(blue) > 0]
     orange_scored = np.r_[False, np.diff(orange) > 0]
     rows = blue_scored ^ orange_scored
     teams = np.where(blue_scored, 0, np.where(orange_scored, 1, -1)).astype(np.int8)
+
     return rows, teams
 
 
 def resolve_match_roster(frame):
-    # Choose each team’s three sustained physical streams and strength mask.
+    # Choose up to three sustained physical streams per team and strength mask.
 
     # Metadata-only slots are rejected by ``source_player_slots``. A transient
     # physical stream is ignored unless its on-field exposure is material
-    # relative to the third-most-present player on its team. This preserves
+    # relative to the least-present selected player. This preserves
     # ordinary 3v3 replays with a ghost/seventh slot while exposing real 4v3,
     # 3v4, and 4v4 states for filtering.
 
     slots = source_player_slots(set(frame.columns))
     by_team = {0: [], 1: []}
     active_by_slot = {}
+
     for slot in slots:
         prefix = f'player_{slot}_'
         team_values = frame[prefix + 'team_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
@@ -179,48 +241,111 @@ def resolve_match_roster(frame):
         if not known.size:
             continue
         team = int(np.bincount(known, minlength=2).argmax())
-        position = np.column_stack([numeric(frame, prefix + axis, np.nan) for axis in ('pos_x', 'pos_y', 'pos_z')])
-        active = numeric(frame, prefix + 'on_field', 0.0).astype(bool) & ~numeric(frame, prefix + 'demoed', 0.0).astype(bool)
+        position = np.column_stack(
+            [numeric(frame, prefix + axis, np.nan) for axis in ('pos_x', 'pos_y', 'pos_z')]
+        )
+        active = (
+            numeric(frame, prefix + 'on_field', 0.0).astype(bool)
+            & ~numeric(frame, prefix + 'demoed', 0.0).astype(bool)
+        )
         exposure = int((active & np.isfinite(position).all(axis=1)).sum())
-        by_team[team].append((slot, exposure))
         active_by_slot[slot] = active
-    if any(len(by_team[team]) < 3 for team in (0, 1)):
-        raise ValueError('could not identify three physical source players for each team')
+
+        if exposure > 0:
+            by_team[team].append((slot, exposure))
+
+    if any(not by_team[team] for team in (0, 1)):
+        raise ValueError('could not identify a physical player for each team')
     selected = {}
     strength_slots = {0: (), 1: ()}
+
     for team in (0, 1):
         ranked = sorted(by_team[team], key=lambda item: (-item[1], item[0]))
-        third_exposure = ranked[2][1]
-        if third_exposure <= 0:
-            raise ValueError(f'team {team} has fewer than three observed on-field players')
+        third_exposure = ranked[min(2, len(ranked) - 1)][1]
         selected[team] = tuple(slot for slot, _ in ranked[:3])
         # A fourth genuine participant has substantial exposure; one-frame
         # parser ghosts do not. This set is only used for strength filtering.
         relevance_floor = max(1, int(np.ceil(third_exposure * 0.25)))
         strength_slots[team] = tuple(slot for slot, exposure in ranked if exposure >= relevance_floor)
+
     blue_strength = sum(active_by_slot[slot].astype(np.int8) for slot in strength_slots[0])
     orange_strength = sum(active_by_slot[slot].astype(np.int8) for slot in strength_slots[1])
-    invalid = ((blue_strength == 4) & (orange_strength == 3)) | ((blue_strength == 3) & (orange_strength == 4)) | ((blue_strength == 4) & (orange_strength == 4))
+    invalid = (
+        ((blue_strength == 4) & (orange_strength == 3))
+        | ((blue_strength == 3) & (orange_strength == 4))
+        | ((blue_strength == 4) & (orange_strength == 4))
+    )
     return selected, ~invalid
 
 
 def remap_match_roster(frame, selected):
     # Map dynamic source slots to the model’s stable blue-then-orange six slots.
-    mapping = {source: destination for destination, source in enumerate((*selected[0], *selected[1]), start=1)}
+    missing_contact = [source for team in (0, 1) for source in selected[team]
+                       if not any(f'player_{source}_{feature}' in frame.columns
+                                  for feature in ('touching_ball', 'is_touching_ball'))
+                       and 'frame_touch_player_slot' not in frame.columns]
+    if missing_contact:
+        raise ValueError(f'missing player touching-ball columns for source slots: {missing_contact}')
+    mapping = {
+        source: team * MAX_PLAYERS_PER_TEAM + position + 1
+        for team in (0, 1)
+        for position, source in enumerate(selected[team])
+    }
     updates = []
-    for source, destination in mapping.items():
-        source_prefix, target_prefix = f'player_{source}_', f'player_{destination}_'
-        team = 0 if destination <= 3 else 1
+
+    source_for_destination = {destination: source for source, destination in mapping.items()}
+
+    for destination in PLAYER_SLOTS:
+        target_prefix = f'player_{destination}_'
+        team = (destination - 1) // MAX_PLAYERS_PER_TEAM
+        source = source_for_destination.get(destination)
+
+        if source is None:
+            updates.append(pl.lit(2, dtype=pl.Int64).alias(target_prefix + 'team_id'))
+            updates.extend(
+                pl.lit(0.0, dtype=pl.Float32).alias(target_prefix + feature)
+                for feature in PLAYER_FEATURES
+            )
+            updates.append(pl.lit(False).alias(target_prefix + 'touching_ball'))
+            continue
+
+        source_prefix = f'player_{source}_'
         updates.append(pl.lit(team, dtype=pl.Int64).alias(target_prefix + 'team_id'))
+
         for feature in PLAYER_FEATURES:
             source_column = source_prefix + feature
             if source_column in frame.columns:
                 updates.append(pl.col(source_column).alias(target_prefix + feature))
             else:
                 updates.append(pl.lit(0.0, dtype=pl.Float32).alias(target_prefix + feature))
-    for column in (name for name in frame.columns if name.startswith('boost_pickup_event_player_') and name.endswith('_slot')):
+        contact_column = next((source_prefix + feature for feature in
+                               ('touching_ball', 'is_touching_ball')
+                               if source_prefix + feature in frame.columns), None)
+        contact = (
+            pl.col(contact_column).cast(pl.Boolean, strict=False).fill_null(False)
+            if contact_column is not None
+            else pl.col('frame_touch_player_slot').cast(pl.Int64, strict=False) == source
+        )
+        updates.append(contact.alias(target_prefix + 'touching_ball'))
+
+    for column in (
+        name
+        for name in frame.columns
+        if name.startswith('boost_pickup_event_player_') and name.endswith('_slot')
+    ):
         values = frame[column].to_list()
-        updates.append(pl.Series(column, [mapping.get(int(value)) if value is not None and int(value) in mapping else None for value in values], dtype=pl.Int64))
+        updates.append(
+            pl.Series(
+                column,
+                [
+                    mapping.get(int(value))
+                    if value is not None and int(value) in mapping
+                    else None
+                    for value in values
+                ],
+                dtype=pl.Int64,
+            )
+        )
     return frame.with_columns(updates)
 
 
@@ -229,18 +354,25 @@ def attach_boost_state(frame):
     times = frame['_source_time'].to_numpy()
     stints = frame['stint_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
     values = np.zeros((frame.height, 34, len(BOOST_FEATURES)), dtype=np.float32)
+
     values[..., :2] = BOOST_POSITIONS
     values[:, :6, 2] = 1.0
     values[:, 6:, 3] = 1.0
     cooldown = np.r_[np.full(6, 10.0), np.full(28, 5.0)]
-    pickup_slots = [name for name in frame.columns if name.startswith('boost_pickup_event_player_') and name.endswith('_slot')]
+    pickup_slots = [
+        name
+        for name in frame.columns
+        if name.startswith('boost_pickup_event_player_') and name.endswith('_slot')
+    ]
     event_times = [[] for _ in range(34)]
     ready_times = [[] for _ in range(34)]
     stint_starts = np.flatnonzero(np.r_[True, stints[1:] != stints[:-1]])
+
     for index in stint_starts:
         for pad in range(34):
             event_times[pad].append(times[index])
             ready_times[pad].append(times[index])
+
     if {'boost_pickup_event_id', 'boost_pickup_type'}.issubset(frame.columns):
         event_ids = frame['boost_pickup_event_id'].to_list()
         kinds = frame['boost_pickup_type'].to_list()
@@ -249,6 +381,7 @@ def attach_boost_state(frame):
             slot: np.column_stack([numeric(frame, f'player_{slot}_pos_{axis}', np.nan) for axis in 'xyz'])
             for slot in PLAYER_SLOTS
         }
+
         seen = set()
         for index, event in enumerate(event_ids):
             if event is None or event in seen:
@@ -275,6 +408,7 @@ def attach_boost_state(frame):
                     pad = int(candidates[distance.argmin()])
                     event_times[pad].append(times[index])
                     ready_times[pad].append(times[index] + cooldown[pad])
+
     for pad in range(34):
         event = np.asarray(event_times[pad], dtype=np.float64)
         ready = np.asarray(ready_times[pad], dtype=np.float64)
@@ -286,7 +420,10 @@ def attach_boost_state(frame):
         refill[valid] = np.maximum(ready[prior[valid]] - times[valid], 0.0)
         values[:, pad, 5] = refill
         values[:, pad, 4] = refill <= 0.0
-    return frame.with_columns(pl.Series(name, values.reshape(frame.height, -1)[:, index]) for index, name in enumerate(BOOST_COLUMNS))
+    return frame.with_columns(
+        pl.Series(name, values.reshape(frame.height, -1)[:, index])
+        for index, name in enumerate(BOOST_COLUMNS)
+    )
 
 
 def apply_random_augmentation(frame):
@@ -340,22 +477,47 @@ def apply_random_augmentation(frame):
     return frame.with_columns(updates)
 
 
-def prepare_replay(frame, random_augmentation=False):
+def prepare_replay(
+    frame,
+    random_augmentation=False,
+    target_sample_rate=TARGET_SAMPLE_RATE,
+    inference=False,
+):
     # Compile one replay with exact targets, dynamic roster mapping, and valid strength states.
-    if TARGET_SAMPLE_RATE <= 0 or TARGET_SAMPLE_RATE > SOURCE_HZ:
-        raise ValueError('TARGET_SAMPLE_RATE must lie in (0, 30]')
-    step = int(round(SOURCE_HZ / TARGET_SAMPLE_RATE))
-    if not np.isclose(step * TARGET_SAMPLE_RATE, SOURCE_HZ):
-        raise ValueError('TARGET_SAMPLE_RATE must evenly divide the 30 Hz source')
+    if target_sample_rate <= 0 or target_sample_rate > SOURCE_HZ:
+        raise ValueError('target_sample_rate must lie in (0, 30]')
+    step = int(round(SOURCE_HZ / target_sample_rate))
+    if not np.isclose(step * target_sample_rate, SOURCE_HZ):
+        raise ValueError('target_sample_rate must evenly divide the 30 Hz source')
     frame = frame.sort('frame_number')
     frame_numbers = frame['frame_number'].cast(pl.Int64).to_numpy()
+
     if np.any(np.diff(frame_numbers) <= 0):
         raise ValueError('frame_number must be strictly increasing within a replay')
     selected, valid_strength = resolve_match_roster(frame)
     frame = remap_match_roster(frame, selected)
+
     source_time = np.cumsum(numeric(frame, 'frame_delta', 0.0), dtype=np.float64)
     goal_row, teams = goal_rows_and_teams(frame)
     stints = frame['stint_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
+    contact_columns = tuple(f'player_{slot}_touching_ball' for slot in PLAYER_SLOTS)
+    contact = frame.select(contact_columns).to_numpy().astype(bool)
+    touching_ball_slot = np.where(contact.sum(axis=1) == 1, contact.argmax(axis=1), -1)
+    next_touch_slot = np.full(frame.height, -1, dtype=np.int64)
+    next_touch_seconds = np.full(frame.height, np.nan, dtype=np.float32)
+    # A continuous contact run is one touch event, not one new touch per frame.
+    previous = np.r_[-1, touching_ball_slot[:-1]]
+    events = np.flatnonzero((touching_ball_slot >= 0)
+                           & ((touching_ball_slot != previous)
+                              | np.r_[True, stints[1:] != stints[:-1]]))
+    following = np.searchsorted(events, np.arange(frame.height), side='right')
+    found = following < events.size
+    rows = np.flatnonzero(found)
+    future = events[following[rows]]
+    same_stint = stints[rows] == stints[future]
+    rows, future = rows[same_stint], future[same_stint]
+    next_touch_slot[rows] = touching_ball_slot[future]
+    next_touch_seconds[rows] = (source_time[future] - source_time[rows]).astype(np.float32)
     goal_time = np.full(frame.height, np.nan, dtype=np.float64)
     goal_team = np.full(frame.height, -1, dtype=np.int8)
     scoring_stints = set()
@@ -366,39 +528,71 @@ def prepare_replay(frame, random_augmentation=False):
             goal_time[rows] = source_time[goals[0]]
             goal_team[rows] = teams[goals[0]]
             scoring_stints.add(stint)
-    frame = frame.with_columns([
-        pl.Series('_source_time', source_time), pl.Series('_window_id', stints),
-        pl.Series('time_until_next_goal', goal_time - source_time),
-        pl.Series('_goal_row', goal_row),
-    ])
     time_until_goal = goal_time - source_time
     within_ten_seconds = np.isfinite(time_until_goal) & (time_until_goal > 0.0) & (time_until_goal <= 10.0)
     blue_target = within_ten_seconds & (goal_team == 0)
     orange_target = within_ten_seconds & (goal_team == 1)
+
+    if inference:
+        goal_time.fill(np.nan)
+        blue_target.fill(False)
+        orange_target.fill(False)
+
+    frame = frame.with_columns([
+        pl.Series('_source_time', source_time), pl.Series('_window_id', stints),
+        pl.Series('_touching_ball_slot', touching_ball_slot),
+        pl.Series('_is_touching_ball', touching_ball_slot >= 0),
+        pl.Series('_next_touch_slot', next_touch_slot),
+        pl.Series('_next_touch_seconds', next_touch_seconds),
+        pl.Series('time_until_next_goal', goal_time - source_time),
+        pl.Series('_goal_row', goal_row),
+    ])
     frame = frame.with_columns([
         pl.Series('blue_goal_in_next_ten_seconds', blue_target),
         pl.Series('orange_goal_in_next_ten_seconds', orange_target),
         pl.Series('neither_goal_in_next_ten_seconds', ~(blue_target | orange_target)),
     ])
     pre_goal = np.r_[goal_row[1:], False]
-    keep = ~goal_row
     active = frame['frame_is_active'].cast(pl.Boolean, strict=False).fill_null(False).to_numpy()
-    keep &= active & valid_strength
+    keep = active & valid_strength
+
+    if not inference:
+        keep &= ~goal_row
+
     frame = frame.filter(pl.Series('_keep_active_strength', keep))
-    anchors = pre_goal[keep]
-    kept_stints = frame['stint_id'].cast(pl.Int64).fill_null(-1).to_numpy()
-    sample = np.zeros(frame.height, dtype=bool)
-    for stint in np.unique(kept_stints):
-        rows = np.flatnonzero(kept_stints == stint)
-        anchor_rows = rows[anchors[rows]]
-        if anchor_rows.size:
-            sample[np.arange(anchor_rows[-1], rows[0] - 1, -step)] = True
-    frame = frame.filter(pl.Series('_sample', sample))
-    frame = frame.filter(pl.col('stint_id').cast(pl.Int64).is_in(list(scoring_stints)))
-    frame = frame.filter((pl.col('blue_team_score').cast(pl.Float32) - pl.col('orange_team_score').cast(pl.Float32)).abs() < 4.0)
+
+    if not inference:
+        anchors = pre_goal[keep]
+        kept_stints = frame['stint_id'].cast(pl.Int64).fill_null(-1).to_numpy()
+        sample = np.zeros(frame.height, dtype=bool)
+
+        for stint in np.unique(kept_stints):
+            rows = np.flatnonzero(kept_stints == stint)
+            anchor_rows = rows[anchors[rows]]
+
+            if anchor_rows.size:
+                sample[np.arange(anchor_rows[-1], rows[0] - 1, -step)] = True
+
+        frame = frame.filter(pl.Series('_sample', sample))
+        frame = frame.filter(pl.col('stint_id').cast(pl.Int64).is_in(list(scoring_stints)))
+        frame = frame.filter(
+            (
+                pl.col('blue_team_score').cast(pl.Float32)
+                - pl.col('orange_team_score').cast(pl.Float32)
+            ).abs()
+            < 4.0
+        )
+
     if frame.is_empty():
         return frame
     current_stints = frame['stint_id'].cast(pl.Int64).fill_null(-1).to_numpy()
+    if random_augmentation:
+        # All frames in a stint share one orientation so future-state labels
+        # remain in the coordinate system of the evaluated frame.
+        choices = {int(stint): bool(np.random.random() < 0.5) for stint in np.unique(current_stints)}
+        augmentation = np.asarray([choices[int(stint)] for stint in current_stints], dtype=bool)
+    else:
+        augmentation = np.zeros(frame.height, dtype=bool)
     updates = [
         pl.col('frame_seconds_elapsed').cast(pl.Float32).alias('seconds_elapsed'),
         (pl.col('frame_seconds_elapsed').cast(pl.Float32) >= 300.0).cast(pl.Float32).alias('overtime'),
@@ -408,9 +602,10 @@ def prepare_replay(frame, random_augmentation=False):
           for feature, value in zip(GOAL_FEATURES, ORANGE_GOAL, strict=True)),
         pl.Series(
             'random_augmentation',
-            np.random.random(frame.height) < 0.5 if random_augmentation else np.zeros(frame.height, dtype=bool),
+            augmentation,
         ),
     ]
+
     for slot in PLAYER_SLOTS:
         prefix = f'player_{slot}_'
         demoed = numeric(frame, prefix + 'demoed', 0.0).astype(bool)
@@ -432,8 +627,14 @@ def prepare_replay(frame, random_augmentation=False):
                     .otherwise(pl.col(prefix + feature).cast(pl.Float32, strict=False).fill_null(0.0))
                     .alias(prefix + feature)
                 )
+
     frame = attach_boost_state(frame.with_columns(updates))
     frame = apply_random_augmentation(frame)
+    frame = frame.with_columns(
+        pl.col(name).cast(pl.Boolean, strict=False).fill_null(False).alias(name)
+        if name in frame.columns else pl.lit(False).alias(name)
+        for name in EVENT_FLAG_COLUMNS
+    )
     return frame.select(OUTPUT_COLUMNS)
 
 class LGPSScaler:
@@ -655,6 +856,13 @@ class EntityTokenizer:
             "entity_types": self.entity_types,
             "entity_teams": torch.from_numpy(entity_teams),
         }
+        if '_touching_ball_slot' in frame.columns:
+            result['touching_ball_slot'] = torch.from_numpy(
+                frame['_touching_ball_slot'].to_numpy().astype(np.int64)
+            )
+            result['is_touching_ball'] = torch.from_numpy(
+                frame['_is_touching_ball'].to_numpy().astype(bool)
+            )
         for name, count, columns, _ in BOOST_ENTITY_GROUPS:
             if name in self.model_entities:
                 result[name] = torch.from_numpy(frame.select(columns).to_numpy().astype(np.float32).reshape(frame.height, count, len(BOOST_FEATURES)))
@@ -664,21 +872,30 @@ class LGPSAgents:
     entity_types = EntityTokenizer.entity_types
     entity_teams = EntityTokenizer.entity_teams
 
-    def __init__(self, model_entities="all", *, targets_per_team=10, geometric_width=1.25):
+    def __init__(self, model_entities="all", *, targets_per_team=10, geometric_width=1.25,
+                 future_frames=(10, 30, 60, 100), sample_rate=TARGET_SAMPLE_RATE,
+                 aux_tasks=(LGPSBallStateAux, LGPSPlayerStateAux, LGPSNextTouchAux)):
         self.model_entities = normalize_model_entities(model_entities)
         self.tokenizer = EntityTokenizer(model_entities=self.model_entities)
         self.targets_per_team, self.geometric_width = targets_per_team, geometric_width
+        self.future_frames = tuple(() if future_frames is None else future_frames)
+        self.sample_rate = sample_rate
+        self.aux_tasks = tuple(() if aux_tasks is None else aux_tasks)
 
-    def build(self, frame, indices=None):
+    def build(self, frame, indices=None, include_aux=True):
         return build_frame_batch(frame, range(frame.height) if indices is None else indices,
                              self.tokenizer,
                              targets_per_team=self.targets_per_team,
                              geometric_width=self.geometric_width,
+                             future_frames=self.future_frames,
+                             sample_rate=self.sample_rate,
+                             include_aux=include_aux, aux_tasks=self.aux_tasks,
                              )
 
 class LGPSDataSource:
-    def __init__(self, path, model_entities="all"):
+    def __init__(self, path, model_entities="all", aux_tasks=()):
         self.model_entities = normalize_model_entities(model_entities)
+        self.aux_tasks = tuple(() if aux_tasks is None else aux_tasks)
         path = Path(path)
         if path.is_file():
             candidate_paths = (
@@ -734,7 +951,7 @@ class LGPSDataSource:
         slots = tuple(int(column.split("_")[1]) for column in team_columns)
         player_columns = player_feature_columns(slots)
         required = {
-            "replay_id", "_source_time", "_window_id", "time_until_next_goal", *GOAL_STATE_COLUMNS,
+            "replay_id", "time_until_next_goal", *GOAL_STATE_COLUMNS,
             *(BIG_BOOST_COLUMNS if "big_boosts" in self.model_entities else ()),
             *(SMALL_BOOST_COLUMNS if "small_boosts" in self.model_entities else ()),
             *CONTEXT_FEATURES,
@@ -742,15 +959,23 @@ class LGPSDataSource:
             *team_columns,
             *player_columns,
         }
+        if any(task in self.aux_tasks for task in (LGPSBallStateAux, LGPSPlayerStateAux)):
+            required.update(("_window_id", "_source_time"))
+        if LGPSNextTouchAux in self.aux_tasks:
+            required.update(("_next_touch_slot", "_next_touch_seconds"))
         goal_columns = tuple(column for column in GOAL_COLUMNS if column in schema)
         missing = required.difference(schema)
         if missing:
             raise ValueError(
-                f"{path}: missing model-ready columns: {sorted(missing)}"
+                f"{path}: missing model-ready columns: {sorted(missing)}; rerun LGPS prepare_dataset"
             )
+        optional = tuple(column for column in (
+            "_source_time", "_window_id",
+            "_touching_ball_slot", "_is_touching_ball", "_next_touch_slot", "_next_touch_seconds",
+        ) if column in schema)
         return tuple(dict.fromkeys(
             (
-            "replay_id", "_source_time", "_window_id", "time_until_next_goal", *GOAL_STATE_COLUMNS,
+            "replay_id", *optional, "time_until_next_goal", *GOAL_STATE_COLUMNS,
                 *goal_columns,
                 *(BIG_BOOST_COLUMNS if "big_boosts" in self.model_entities else ()),
                 *(SMALL_BOOST_COLUMNS if "small_boosts" in self.model_entities else ()),
@@ -761,7 +986,7 @@ class LGPSDataSource:
             )
         ))
 
-    def read_batches(self, path, batch_size=2048, offset=0, length=None):
+    def read_batches(self, path, batch_size=2048, offset=0, length=None, lookahead=0):
         # Yield a contiguous range by reading only intersecting row groups.
         end = self.row_counts[path] if length is None else min(
             self.row_counts[path], offset + length
@@ -782,11 +1007,13 @@ class LGPSDataSource:
             last = min(end - group_start, group_rows)
             current = pl.from_arrow(table.slice(first, last - first))
             pending = current if pending is None else pl.concat([pending, current])
-            while pending.height >= batch_size:
-                yield pending.slice(0, batch_size)
+            while pending.height >= batch_size + lookahead:
+                yield pending.slice(0, batch_size + lookahead), batch_size
                 pending = pending.slice(batch_size)
-        if pending is not None and pending.height:
-            yield pending
+        while pending is not None and pending.height:
+            count = min(batch_size, pending.height)
+            yield pending.slice(0, count + lookahead), count
+            pending = pending.slice(count)
 
 class LGPSDataset(IterableDataset):
     def __init__(
@@ -799,6 +1026,8 @@ class LGPSDataset(IterableDataset):
         split_start=0,
         split_end=None,
         drop_last=False,
+        lookahead=0,
+        include_aux=True,
     ):
         super().__init__()
         self.drop_last = drop_last
@@ -809,6 +1038,8 @@ class LGPSDataset(IterableDataset):
         self.world_size = world_size
         self.split_start = split_start
         self.split_end = source.total_rows if split_end is None else split_end
+        self.lookahead = lookahead
+        self.include_aux = include_aux
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -836,10 +1067,12 @@ class LGPSDataset(IterableDataset):
             for frame in self.source.read_batches(
                 path, batch_size=self.batch_size, offset=local_start,
                 length=local_end - local_start,
+                lookahead=self.lookahead,
             ):
-                if self.drop_last and frame.height != self.batch_size:
+                frame, count = frame
+                if self.drop_last and count != self.batch_size:
                     break
-                yield self.builder.build(frame, range(frame.height))
+                yield self.builder.build(frame, range(count), include_aux=self.include_aux)
 
 
 
@@ -857,16 +1090,22 @@ class SerializedDataset(IterableDataset):
 class LGPSData:
     # Data pipeline assembled from training, model, and runtime contracts.
     def __init__(self, train_config, model_config, runtime_config, rank=0, world_size=1):
+        if not {'ball', 'players'}.issubset(model_config.model_entities):
+            raise ValueError('LGPS auxiliary training requires ball and player entities')
         self.train_config = train_config
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.rank = rank
         self.world_size = world_size
-        self.source = LGPSDataSource(train_config.input_path, model_config.model_entities)
+        self.source = LGPSDataSource(train_config.input_path, model_config.model_entities,
+                                     train_config.aux_tasks)
         self.builder = LGPSAgents(
             model_config.model_entities,
             targets_per_team=model_config.targets_per_team,
             geometric_width=model_config.geometric_width,
+            future_frames=train_config.future_frames,
+            sample_rate=model_config.sample_rate,
+            aux_tasks=train_config.aux_tasks,
         )
 
         train_end = int(self.source.total_rows * train_config.train_split)
@@ -907,6 +1146,11 @@ class LGPSData:
             split_start=split_start,
             split_end=split_end,
             drop_last=(split == "train" and self.runtime_config.drop_last),
+            lookahead=(max(self.train_config.future_frames or ())
+                       if split == 'train' and self.train_config.future_frames
+                       and any(task in self.train_config.aux_tasks
+                               for task in (LGPSBallStateAux, LGPSPlayerStateAux)) else 0),
+            include_aux=(split == 'train' and bool(self.train_config.aux_tasks)),
         )
         return DataLoader(
             SerializedDataset(dataset) if num_workers else dataset,
@@ -914,16 +1158,18 @@ class LGPSData:
         )
 
     def train_loader(self):
-        return self.loader(self.train_config.batch_size, "train")
+        return self.loader(self.runtime_config.per_gpu_batch_size or self.train_config.batch_size, "train")
 
     def validation_loader(self):
-        return self.loader(self.train_config.validation_batch_size, "validation")
+        batch_size = self.runtime_config.per_gpu_batch_size or self.train_config.batch_size
+        return self.loader(min(self.train_config.validation_batch_size, batch_size), "validation")
 
     def test_loader(self):
-        return self.loader(self.train_config.validation_batch_size, "test")
+        batch_size = self.runtime_config.per_gpu_batch_size or self.train_config.batch_size
+        return self.loader(min(self.train_config.validation_batch_size, batch_size), "test")
 
 
-def prepare_dataset(source, output_dir, *, max_replays=None):
+def prepare_dataset(source, output_dir, *, max_replays=None, target_sample_rate=TARGET_SAMPLE_RATE):
     # Accept a Parquet file, tar archive, or nested source directory.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -938,7 +1184,8 @@ def prepare_dataset(source, output_dir, *, max_replays=None):
                 if replay_id in seen_replays:
                     raise ValueError(f'duplicate replay_id across source files: {replay_id}')
                 seen_replays.add(replay_id)
-                prepared = prepare_replay(replay, random_augmentation=(split == 'train'))
+                prepared = prepare_replay(replay, random_augmentation=(split == 'train'),
+                                          target_sample_rate=target_sample_rate)
                 if not prepared.is_empty():
                     if split not in writers:
                         writers[split] = pq.ParquetWriter(
@@ -954,4 +1201,3 @@ def prepare_dataset(source, output_dir, *, max_replays=None):
         for writer in writers.values():
             writer.close()
     return {split: output_dir / f'{split}.parquet' for split in writers}
-

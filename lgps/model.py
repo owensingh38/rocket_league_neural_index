@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from props import BALL_FEATURES, CONTEXT_FEATURES, GEOMETRY_DIM, GOAL_FEATURES, LGPSModelConfig, PLAYER_FEATURES, normalize_model_entities
+from props import BALL_FEATURES, CONTEXT_FEATURES, GOAL_FEATURES, PLAYER_FEATURES, normalize_model_entities
+from .config import LGPSModelConfig
 from .dataset import LGPSScaler
+from .aux_tasks import LGPSBallStateAux, LGPSPlayerStateAux, LGPSNextTouchAux
 
 torch.set_float32_matmul_precision("high")
 
@@ -41,6 +43,10 @@ class LGPSAgent(nn.Module):
 
 
 class PairwiseGeometry(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('geometry_scale', LGPSScaler.GEOMETRY_SCALE.clone(), persistent=False)
+
     def geometry_states(self, ball, players, goals):
         # Geometry only needs position and velocity.
         # Player orientation and other state still remain available in each
@@ -161,7 +167,7 @@ class PairwiseGeometry(nn.Module):
         )
 
         # Keep physical magnitudes in a numerically stable range for AMP.
-        return LGPSScaler.geometry(geometry)
+        return geometry / self.geometry_scale
 
 
 # Extra features are edge-local. Each block has its own input weights in
@@ -179,14 +185,18 @@ RELATION_FEATURES = (
     "nose_xy_sin", "nose_xz_sin", "nose_yz_sin",
     "nose_xy_cos", "nose_xz_cos", "nose_yz_cos",
 )
-# Existing 15 + seven 19-channel relationships + two ball-nearest 4-channel groups.
+# The width follows the relation groups. It is never selected independently.
+BASE_GEOMETRY_WIDTH = 15
+EXPANDED_GEOMETRY_WIDTH = BASE_GEOMETRY_WIDTH + len(RELATION_NAMES) * len(RELATION_FEATURES) + 2 * 4
+
+
+def geometry_width(expanded_geometry):
+    return EXPANDED_GEOMETRY_WIDTH if expanded_geometry else BASE_GEOMETRY_WIDTH
 
 class RelationalGeometry(PairwiseGeometry):
-    def __init__(self, geometry_dim=GEOMETRY_DIM, pad_count=34):
+    def __init__(self, expanded_geometry=False, pad_count=34):
         super().__init__()
-        if geometry_dim not in (15, GEOMETRY_DIM):
-            raise ValueError("geometry_dim must be 15 or 156")
-        self.geometry_dim = geometry_dim
+        self.expanded_geometry = bool(expanded_geometry)
         self.pad_count = pad_count
         self.include_boosts = pad_count > 0
 
@@ -196,8 +206,8 @@ class RelationalGeometry(PairwiseGeometry):
         # Do not allocate the 43-token boost layout when boosts are excluded.
         # The selected no-boost model is exactly a nine-token model.
         entity_count = 9 + self.pad_count
-        geometry = core.new_zeros(batch, entity_count, entity_count, self.geometry_dim)
-        geometry[:, :9, :9, :15] = core
+        geometry = core.new_zeros(batch, entity_count, entity_count, geometry_width(self.expanded_geometry))
+        geometry[:, :9, :9, :BASE_GEOMETRY_WIDTH] = core
         states = self.geometry_states(ball, players, goals)
         pos = torch.nan_to_num(states[..., :3])
         live = (players[..., PLAYER_FEATURES.index("on_field")] > 0.5)
@@ -205,8 +215,8 @@ class RelationalGeometry(PairwiseGeometry):
         live &= torch.isfinite(players[..., :3]).all(-1)
         valid = torch.cat((torch.ones(batch, 1, device=ball.device, dtype=torch.bool),
                            live, torch.ones(batch, 2, device=ball.device, dtype=torch.bool)), 1)
-        geometry[:, :9, :9, :15] *= (valid[:, :, None] & valid[:, None, :])[..., None]
-        if self.geometry_dim == 15:
+        geometry[:, :9, :9, :BASE_GEOMETRY_WIDTH] *= (valid[:, :, None] & valid[:, None, :])[..., None]
+        if not self.expanded_geometry:
             pad_geometry = core.new_zeros(batch, entity_count, entity_count, 3)
             allowed = torch.zeros(batch, entity_count, entity_count, device=ball.device, dtype=torch.bool)
             allowed[:, :9, :9] = True
@@ -245,7 +255,7 @@ class RelationalGeometry(PairwiseGeometry):
         teams = entity_teams[:, 1:7]
         same = teams[:, :, None] == teams[:, None, :]
         identity = torch.eye(6, device=ball.device, dtype=torch.bool)
-        masks = torch.zeros(batch, 7, 6, 9, device=ball.device, dtype=torch.bool)
+        masks = torch.zeros(batch, len(RELATION_NAMES), 6, 9, device=ball.device, dtype=torch.bool)
         masks[:, 0, :, 0] = True
         masks[:, 1, :, 7] = teams == 0
         masks[:, 1, :, 8] = teams == 1
@@ -261,9 +271,9 @@ class RelationalGeometry(PairwiseGeometry):
             minimum = distances.amin(-1, keepdim=True)
             # Include tied nearest players to preserve permutation equivariance.
             masks[:, group, :, 1:7] = candidates & (distances == minimum)
-        for group in range(7):
-            start = 15 + group * 19
-            geometry[:, 1:7, :9, start:start+19] = torch.where(
+        for group in range(len(RELATION_NAMES)):
+            start = BASE_GEOMETRY_WIDTH + group * len(RELATION_FEATURES)
+            geometry[:, 1:7, :9, start:start+len(RELATION_FEATURES)] = torch.where(
                 masks[:, group, :, :, None], relation, 0.0)
         ball_delta = pos[:, 1:7] - pos[:, :1]
         ball_rel = torch.cat((ball_delta.norm(dim=-1, keepdim=True)/6000.0,
@@ -272,7 +282,7 @@ class RelationalGeometry(PairwiseGeometry):
             candidates = live & (teams == team)
             distances = ball_delta.norm(dim=-1).masked_fill(~candidates, float("inf"))
             nearest = candidates & (distances == distances.amin(-1, keepdim=True))
-            start = 148 + team*4
+            start = BASE_GEOMETRY_WIDTH + len(RELATION_NAMES) * len(RELATION_FEATURES) + team * 4
             geometry[:, 0, 1:7, start:start+4] = torch.where(nearest[..., None], ball_rel, 0.0)
 
         # Pads have only planar positional edges to live players.
@@ -293,7 +303,7 @@ class RelationalGeometry(PairwiseGeometry):
         return geometry, pad_geometry, allowed, pad_edges
 
 class LGPSAttention(nn.Module):
-    def __init__(self, d_model, num_heads, geometry_dim, pairwise_rank, dropout, include_boosts=True):
+    def __init__(self, d_model, num_heads, expanded_geometry, pairwise_rank, dropout, include_boosts=True):
         super().__init__()
 
         if d_model % num_heads != 0:
@@ -313,7 +323,7 @@ class LGPSAttention(nn.Module):
 
         # Geometry remains an explicit physical relationship between entities.
         self.geometry_bias = nn.Sequential(
-            nn.Linear(geometry_dim, d_model),
+            nn.Linear(geometry_width(expanded_geometry), d_model),
             nn.GELU(),
             nn.Linear(d_model, num_heads),
         )
@@ -362,7 +372,6 @@ class LGPSAttention(nn.Module):
         # entity carries NaN/Inf fields. Entity encoders expose missingness in
         # their stream features; this path treats non-finite learned values as
         # a neutral zero contribution instead of contaminating an attention row.
-        streams = torch.nan_to_num(streams, nan=0.0, posinf=0.0, neginf=0.0)
         batch_size, entity_count, _ = streams.shape
         source = self.pairwise_source(streams).view(
             batch_size,
@@ -409,7 +418,7 @@ class LGPSAttention(nn.Module):
         #         geometry and its geometry-bias weights do not change between those
         #         applications. Caching this projection is algebraically identical to
         #         recomputing it on every loop while avoiding the dominant repeated MLP.
-        #         
+        #
         geometry = torch.nan_to_num(geometry, nan=0.0, posinf=0.0, neginf=0.0)
         pad_geometry = torch.nan_to_num(pad_geometry, nan=0.0, posinf=0.0, neginf=0.0)
         batch_size, entity_count = geometry.shape[:2]
@@ -434,8 +443,6 @@ class LGPSAttention(nn.Module):
         pad_geometry, allowed, pad_edges, core_count, static_geometry_bias=None,
     ):
         streams = torch.nan_to_num(streams, nan=0.0, posinf=0.0, neginf=0.0)
-        geometry = torch.nan_to_num(geometry, nan=0.0, posinf=0.0, neginf=0.0)
-        pad_geometry = torch.nan_to_num(pad_geometry, nan=0.0, posinf=0.0, neginf=0.0)
         batch_size, entity_count = streams.shape[:2]
         queries = self.q(streams).view(
             batch_size,
@@ -504,7 +511,7 @@ class LGPSTransformerBlock(nn.Module):
         self.attention = LGPSAttention(
             config.d_model,
             config.num_heads,
-            config.geometry_dim,
+            config.expanded_geometry,
             config.pairwise_rank,
             config.dropout,
             include_boosts=("big_boosts" in config.model_entities or "small_boosts" in config.model_entities),
@@ -583,11 +590,12 @@ class LearnedQueryPooling(nn.Module):
 
 
 class LGPSTransformer(nn.Module):
-    def __init__(self, config: LGPSModelConfig = LGPSModelConfig()):
+    def __init__(self, config: LGPSModelConfig = LGPSModelConfig(), aux_tasks=None,
+                 future_frames=(10, 30, 60, 100)):
         super().__init__()
         self.config = config
         self.model_entities = normalize_model_entities(config.model_entities)
-        self.entity_indices = torch.tensor(
+        entity_indices = torch.tensor(
             ([0] if "ball" in self.model_entities else [])
             + (list(range(1, 7)) if "players" in self.model_entities else [])
             + ([7, 8] if "goals" in self.model_entities else [])
@@ -595,12 +603,17 @@ class LGPSTransformer(nn.Module):
             + (list(range(15, 43)) if "small_boosts" in self.model_entities else []),
             dtype=torch.long,
         )
-        self.core_count = sum(index < 9 for index in self.entity_indices.tolist())
-        self.geometry_indices = torch.tensor(
-            [index for index in self.entity_indices.tolist() if index < 9]
-            + list(range(9, 9 + len(self.entity_indices) - self.core_count)),
+        self.core_count = sum(index < 9 for index in entity_indices.tolist())
+        self.register_buffer('entity_indices', entity_indices, persistent=False)
+        self.register_buffer('geometry_indices', torch.tensor(
+            [index for index in entity_indices.tolist() if index < 9]
+            + list(range(9, 9 + len(entity_indices) - self.core_count)),
             dtype=torch.long,
-        )
+        ), persistent=False)
+        self.register_buffer('ball_scale', LGPSScaler.BALL_SCALE.clone(), persistent=False)
+        self.register_buffer('player_scale', LGPSScaler.PLAYER_SCALE.clone(), persistent=False)
+        self.register_buffer('goal_scale', LGPSScaler.GOAL_SCALE.clone(), persistent=False)
+        self.register_buffer('context_scale', LGPSScaler.CONTEXT_SCALE.clone(), persistent=False)
 
         # Ball, player, and goal entities have different raw feature spaces.
         # All six players share one player encoder so player slots do not
@@ -646,7 +659,7 @@ class LGPSTransformer(nn.Module):
         # Explicit pairwise physical relationships are computed once per frame
         # and used as attention biases in every transformer block.
         self.geometry = RelationalGeometry(
-            geometry_dim=config.geometry_dim,
+            expanded_geometry=config.expanded_geometry,
             pad_count=len(self.entity_indices) - self.core_count,
         )
 
@@ -685,16 +698,28 @@ class LGPSTransformer(nn.Module):
                 config.num_outputs,
             ),
         )
+        # Auxiliary heads share the final spatial representation with the
+        # primary goal head. Ordinary inference still returns only goal logits.
+        self.ball_state_aux = LGPSBallStateAux(config.d_model, future_frames)
+        self.player_state_aux = LGPSPlayerStateAux(config.d_model, future_frames)
+        self.next_touch_aux = LGPSNextTouchAux(config.d_model)
+        # None means the goal task runs alone; auxiliary heads remain inert.
+        self.aux_tasks = frozenset(() if aux_tasks is None else aux_tasks)
+        for task, head in ((LGPSBallStateAux, self.ball_state_aux),
+                           (LGPSPlayerStateAux, self.player_state_aux),
+                           (LGPSNextTouchAux, self.next_touch_aux)):
+            if task not in self.aux_tasks:
+                head.requires_grad_(False)
 
 
     def encode_streams(self, ball, players, goals, big_boosts, small_boosts, entity_types, entity_teams):
         streams = []
         if "ball" in self.model_entities:
-            streams.append(self.ball_stream(LGPSScaler.ball(ball)).unsqueeze(1))
+            streams.append(self.ball_stream(ball.float() / self.ball_scale).unsqueeze(1))
         if "players" in self.model_entities:
-            streams.append(self.player_stream(LGPSScaler.player(players)))
+            streams.append(self.player_stream(players.float() / self.player_scale))
         if "goals" in self.model_entities:
-            streams.append(self.goal_stream(LGPSScaler.goal(goals)))
+            streams.append(self.goal_stream(goals.float() / self.goal_scale))
         if "big_boosts" in self.model_entities:
             if big_boosts is None:
                 raise ValueError("big_boosts must be supplied when selected")
@@ -709,7 +734,7 @@ class LGPSTransformer(nn.Module):
         return streams + self.type_embedding(entity_types)[None] + self.team_embedding(entity_teams)
 
     def forward(self, ball, players, goals, entity_types, entity_teams, game_context,
-                big_boosts=None, small_boosts=None):
+                big_boosts=None, small_boosts=None, return_aux=False):
         if entity_types.ndim == 2:
             entity_types = entity_types[0]
         if entity_types.numel() != len(self.entity_indices):
@@ -734,16 +759,17 @@ class LGPSTransformer(nn.Module):
             tuple(value for value in (big_boosts, small_boosts) if value is not None), dim=1)
         with torch.autocast(device_type=ball.device.type, enabled=False):
             full_teams = entity_teams.new_full((batch, 43), 2)
-            full_teams[:, self.entity_indices.to(entity_teams.device)] = entity_teams
+            full_teams[:, self.entity_indices] = entity_teams
             full_geometry, full_pad_geometry, full_allowed, full_pad_edges = self.geometry(
                 ball.float(), players.float(), goals.float(),
                 current_boosts.float() if current_boosts is not None else None, full_teams)
-        selected = self.geometry_indices.to(full_geometry.device)
+        selected = self.geometry_indices
         geometry = full_geometry.index_select(1, selected).index_select(2, selected)
         pad_geometry = full_pad_geometry.index_select(1, selected).index_select(2, selected)
         allowed = full_allowed.index_select(1, selected).index_select(2, selected)
         pad_edges = full_pad_edges.index_select(1, selected).index_select(2, selected)
-        geometry, pad_geometry = geometry.to(current.dtype), pad_geometry.to(current.dtype)
+        geometry = torch.nan_to_num(geometry, nan=0.0, posinf=0.0, neginf=0.0).to(current.dtype)
+        pad_geometry = torch.nan_to_num(pad_geometry, nan=0.0, posinf=0.0, neginf=0.0).to(current.dtype)
         types = F.one_hot(entity_types, num_classes=4).float().expand(batch, -1, -1)
         teams = F.one_hot(entity_teams, num_classes=3).float()
         role_ids = torch.where(entity_types == 0, 0, torch.where(entity_types == 1, 1 + entity_teams,
@@ -757,51 +783,32 @@ class LGPSTransformer(nn.Module):
                 current = block(state, geometry, types, teams, roles, pad_geometry, allowed, pad_edges,
                                 self.core_count, static_geometry_bias)
                 loop_index += 1
-        pooled = self.pool(current[:, :self.core_count])
-        context = (self.context_token(LGPSScaler.context(game_context)) if "context" in self.model_entities
+        shared = current[:, :self.core_count]
+        pooled = self.pool(shared)
+        context = (self.context_token(game_context.float() / self.context_scale) if "context" in self.model_entities
                    else current.new_zeros(batch, self.config.d_model))
-        return self.head(torch.cat((pooled, context), dim=-1))
+        logits = self.head(torch.cat((pooled, context), dim=-1))
+        if not return_aux:
+            return logits
 
-# Model construction is deferred to the training cell. This is important
-# for in-notebook DDP because CUDA state must not be copied into workers.
+        player_streams = shared[:, 1:7]
+        auxiliary_context = pooled + context
+        auxiliary = {}
+        if LGPSBallStateAux in self.aux_tasks:
+            auxiliary.update(self.ball_state_aux(auxiliary_context))
+        if LGPSPlayerStateAux in self.aux_tasks:
+            auxiliary.update(self.player_state_aux(player_streams, auxiliary_context))
+        if LGPSNextTouchAux in self.aux_tasks:
+            auxiliary['next_touch'] = self.next_touch_aux(player_streams, auxiliary_context)
+        return logits, auxiliary, shared
 
-def assert_player_permutation_invariant(
-    model,
-    ball,
-    players,
-    goals,
-    entity_types,
-    entity_teams,
-    game_context,
-):
-    model.eval()
-    with torch.inference_mode():
-        original = model(
-            ball,
-            players,
-            goals,
-            entity_types,
-            entity_teams,
-            game_context,
-            torch.zeros(ball.shape[0], 6, 6, device=ball.device),
-            torch.zeros(ball.shape[0], 28, 6, device=ball.device),
-        )
-        permutation = torch.tensor(
-            [2, 0, 1, 5, 3, 4],
-            device=players.device,
-        )
-        permuted = model(
-            ball,
-            players[:, permutation],
-            goals,
-            entity_types,
-            entity_teams,
-            game_context,
-            torch.zeros(ball.shape[0], 6, 6, device=ball.device),
-            torch.zeros(ball.shape[0], 28, 6, device=ball.device),
-        )
-    if not torch.allclose(original, permuted, atol=1e-5):
-        raise AssertionError(
-            "Player-slot permutation changed the pooled prediction."
-        )
 
+def load_lgps_weights(model, state):
+    # Historical goal-only checkpoints remain usable for inference. Only the
+    # newly introduced auxiliary heads may be absent from their state dicts.
+    result = model.load_state_dict(state, strict=False)
+    prefixes = ('ball_state_aux.', 'player_state_aux.', 'next_touch_aux.')
+    unexpected = list(result.unexpected_keys)
+    missing = [name for name in result.missing_keys if not name.startswith(prefixes)]
+    if unexpected or missing:
+        raise RuntimeError(f'LGPS checkpoint mismatch: missing={missing}, unexpected={unexpected}')

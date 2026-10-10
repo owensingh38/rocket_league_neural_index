@@ -5,26 +5,26 @@ import json
 import math
 import os
 import socket
-import subprocess
-import sys
 import time
-import cloudpickle
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from pathlib import Path
-from props import LGPSRuntimeConfig, OUTPUT_DIR, collapse_probabilities
+from .config import LGPSRuntimeConfig, OUTPUT_DIR
+from .aux_tasks import LGPSBallStateAux, LGPSGradNorm, LGPSNextTouchAux, LGPSPlayerStateAux
+from .targets import collapse_probabilities
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score, roc_curve
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 from .dataset import LGPSData
 from .model import LGPSTransformer
 
-
 plt.switch_backend("Agg")
+
 
 class DistributedContext:
     def __init__(self, rank=0, world_size=1, runtime_config=None):
@@ -82,9 +82,20 @@ class WandbAdapter:
             raise ImportError("W&B reporting requires `pip install wandb`") from error
         self.wandb = wandb
         self.run = wandb.init(project=project, entity=entity, name=name, mode=mode)
+        self.run.define_metric('train/batch')
+        self.run.define_metric('train/*', step_metric='train/batch')
+        for split in ('validation', 'test'):
+            self.run.define_metric(f'{split}/epoch')
+            self.run.define_metric(f'{split}/*', step_metric=f'{split}/epoch')
+
+    def log_training(self, metrics, batch, epoch):
+        # Training curves receive one point per optimizer microbatch.
+        payload = {'train/batch': int(batch), 'train/epoch': int(epoch)}
+        payload.update({f'train/{key}': value for key, value in metrics.items()})
+        self.run.log(payload)
 
     def log_evaluation(self, metrics, epoch, split):
-        payload = {"epoch": int(epoch)}
+        payload = {f'{split}/epoch': int(epoch)}
         for key, value in metrics.items():
             if key != "calibration_bins" and isinstance(value, (int, float, np.number)):
                 payload[f"{split}/{key}"] = value
@@ -98,7 +109,7 @@ class WandbAdapter:
                                        count, float(prediction_sum) / count if count else None,
                                        float(outcome_sum) / count if count else None)
             payload[f"{split}/calibration_bins"] = table
-        self.run.log(payload, step=int(epoch))
+        self.run.log(payload)
 
 
 class BatchDevice:
@@ -313,32 +324,36 @@ class LGPSClassificationMetrics:
 
 
 class LGPSTrainingMetrics:
-    # GPU-resident inexpensive training metrics.
-    #
-    #     Exact sklearn metrics remain validation/test
-    #     work and are deliberately absent from the per-batch training hot path.
-    #     
+    # Accumulate inexpensive metrics during training.
+
     def __init__(self, device, targets_per_team):
         self.targets_per_team = targets_per_team
         self.loss = torch.zeros((), device=device, dtype=torch.float64)
+        self.primary_loss = torch.zeros((), device=device, dtype=torch.float64)
         self.brier = torch.zeros((), device=device, dtype=torch.float64)
         self.examples = torch.zeros((), device=device, dtype=torch.float64)
 
     @torch.no_grad()
-    def update(self, loss, logits, targets):
+    def update(self, loss, primary_loss, logits, targets):
         probabilities = collapse_probabilities(logits.detach().float().softmax(dim=-1), self.targets_per_team)
         count = targets.shape[0]
         self.loss += loss.detach().double() * count
+        self.primary_loss += primary_loss.detach().double() * count
         target_probability = probabilities.gather(1, targets[:, None]).squeeze(1)
         self.brier += (probabilities.square().sum(dim=-1) - 2 * target_probability + 1).sum().double()
         self.examples += count
 
     def compute(self):
-        if not self.examples.item():
+        totals = torch.stack((self.loss, self.primary_loss, self.brier, self.examples))
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        loss, primary_loss, brier, examples = totals
+        if not examples.item():
             raise RuntimeError("no training examples were observed")
         return {
-            "loss": (self.loss / self.examples).item(),
-            "brier": (self.brier / self.examples).item(),
+            "loss": (loss / examples).item(),
+            "primary_loss": (primary_loss / examples).item(),
+            "brier": (brier / examples).item(),
         }
 
 
@@ -406,7 +421,7 @@ class LGPSResults:
         axis.set(
             title="LGPS Training Loss by Epoch",
             xlabel="Epoch",
-            ylabel="Cross-entropy loss",
+            ylabel="Combined training loss",
         )
         axis.grid(alpha=0.2)
         figure.tight_layout()
@@ -575,10 +590,23 @@ class LGPSTrainer:
             physical_batch_size * self.accumulation_steps
         )
         self.results = LGPSResults(OUTPUT_DIR)
+        future_frames = config.future_frames or ()
+        self.aux_task_names = tuple(
+            ([f'ball_{frame}' for frame in future_frames]
+             if LGPSBallStateAux in config.aux_tasks else [])
+            + ([f'player_{frame}' for frame in future_frames]
+               if LGPSPlayerStateAux in config.aux_tasks else [])
+            + (['next_touch'] if LGPSNextTouchAux in config.aux_tasks else [])
+        )
+        self.gradnorm = LGPSGradNorm(
+            self.aux_task_names, alpha=config.gradnorm_alpha,
+            momentum=config.gradnorm_momentum, device=self.device,
+        )
+        self.training_step = 0
         self.wandb_adapter = (
-            WandbAdapter(runtime_config.wandb_project, runtime_config.wandb_entity,
-                         runtime_config.wandb_run_name, runtime_config.wandb_mode)
-            if runtime_config.wandb_project is not None and context.is_main else None
+            WandbAdapter(self.runtime_config.wandb_project, self.runtime_config.wandb_entity,
+                         self.runtime_config.wandb_run_name, self.runtime_config.wandb_mode)
+            if self.runtime_config.wandb_project is not None and context.is_main else None
         )
 
         # AdamW is the main optimizer for the transformer parameters.
@@ -699,6 +727,8 @@ class LGPSTrainer:
             if isinstance(self.model, DDP)
             else self.model
         )
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
         return model
 
     def forward(self, batch, evaluation=False):
@@ -708,11 +738,25 @@ class LGPSTrainer:
             return model(
                 ball, batch["players"], batch["goals"], batch["entity_types"],
                 batch["entity_teams"], batch["game_context"], batch.get("big_boosts"),
-                batch.get("small_boosts"),
+                batch.get("small_boosts"), return_aux=not evaluation and bool(self.aux_task_names),
             )
         if not evaluation and model.training and self.runtime_config.activation_checkpointing:
             return checkpoint(call_model, batch["ball"], use_reentrant=False)
         return call_model(batch["ball"])
+
+    def auxiliary_losses(self, predictions, batch):
+        raw = self.raw_model
+        losses = {}
+        if LGPSBallStateAux in self.config.aux_tasks:
+            losses.update(raw.ball_state_aux.losses(predictions, batch['aux_ball_targets']))
+        if LGPSPlayerStateAux in self.config.aux_tasks:
+            losses.update(raw.player_state_aux.losses(predictions, batch['aux_player_targets']))
+        if LGPSNextTouchAux in self.config.aux_tasks:
+            losses['next_touch'] = raw.next_touch_aux.loss(
+                predictions['next_touch'], batch['aux_next_touch_slot'],
+                batch['aux_next_touch_seconds'],
+            )
+        return losses
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -758,9 +802,14 @@ class LGPSTrainer:
                     dtype=self.autocast_dtype,
                     enabled=self.amp_enabled,
                 ):
-                    logits = self.forward(batch)
-
-                    raw_loss = -(batch["temporal_targets"] * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+                    output = self.forward(batch)
+                    logits, auxiliary_predictions, shared = output if self.aux_task_names else (output, {}, None)
+                    primary_loss = -(batch["temporal_targets"] * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+                    auxiliary_losses = self.auxiliary_losses(auxiliary_predictions, batch)
+                    raw_loss, task_weights = (
+                        self.gradnorm.combine(primary_loss, auxiliary_losses, shared)
+                        if self.aux_task_names else (primary_loss, {})
+                    )
                     loss = raw_loss * (
                         local_count * self.context.world_size / self.effective_batch_size
                     )
@@ -774,8 +823,30 @@ class LGPSTrainer:
                 accumulated_examples = 0
 
             if local_count:
-                metrics.update(raw_loss, logits, batch["collapsed_targets"])
+                metrics.update(raw_loss, primary_loss, logits, batch["collapsed_targets"])
             local_examples += local_count
+            self.training_step += 1
+            if self.runtime_config.wandb_project is not None:
+                logged_losses = torch.stack(
+                    [raw_loss.detach(), primary_loss.detach()]
+                    + [auxiliary_losses[name][0].detach() for name in self.aux_task_names]
+                ).float()
+                if self.context.is_distributed:
+                    dist.all_reduce(logged_losses, op=dist.ReduceOp.SUM)
+                    logged_losses /= self.context.world_size
+                if self.wandb_adapter is not None:
+                    self.wandb_adapter.log_training(
+                        {
+                            'loss': logged_losses[0].item(),
+                            'primary_loss': logged_losses[1].item(),
+                            **{f'aux/{name}': logged_losses[index + 2].item()
+                               for index, name in enumerate(self.aux_task_names)},
+                            **{f'weight/{name}': task_weights[name]
+                               for name in self.aux_task_names},
+                            'learning_rate': self.optimizer.param_groups[0]['lr'],
+                        },
+                        self.training_step, epoch,
+                    )
 
             # Only rank 0 prints progress to avoid duplicate console output.
             if (
@@ -795,6 +866,7 @@ class LGPSTrainer:
                     f"Epoch {epoch}/{self.config.epochs} | "
                     f"batch {batch_index:,} | "
                     f"loss {raw_loss.detach().item():.5f} | "
+                    f"goal {primary_loss.detach().item():.5f} | "
                     f"grad {float(gradient_norm):.4f} | "
                     f"lr {self.optimizer.param_groups[0]['lr']:.2e} | "
                     f"local examples {local_examples:,} | "
@@ -814,6 +886,7 @@ class LGPSTrainer:
         self.context.print(
             f"Epoch {epoch}/{self.config.epochs} | training finished | "
             f"loss {result['loss']:.5f} | "
+            f"goal {result['primary_loss']:.5f} | "
             f"brier {result['brier']:.5f} | "
             f"time {elapsed:.1f}s"
         )
@@ -937,7 +1010,6 @@ class LGPSTrainer:
                 row["learning_rate"] = self.optimizer.param_groups[0]["lr"]
                 history.append(row)
                 if self.wandb_adapter is not None:
-                    self.wandb_adapter.log_evaluation(train_metrics, epoch, "train")
                     if self.validation_loader is not None:
                         self.wandb_adapter.log_evaluation(validation_metrics, epoch, "validation")
 
@@ -969,6 +1041,8 @@ class LGPSTrainer:
                 torch.save(
                     {
                         "model_state_dict": self.raw_model.state_dict(),
+                        "gradnorm_initial": self.gradnorm.initial.cpu(),
+                        "gradnorm_weights": self.gradnorm.weights.cpu(),
                         "model_config": self.raw_model.config.__dict__,
                         "train_config": self.config.__dict__,
                         "epoch": epoch,
@@ -1046,7 +1120,8 @@ class LGPSTrainer:
         return None
 
 def create_model(model_config, train_config):
-    return LGPSTransformer(config=model_config)
+    return LGPSTransformer(config=model_config, aux_tasks=train_config.aux_tasks,
+                           future_frames=train_config.future_frames)
 
 
 def prepare_model(model_config, train_config, runtime_config, context):
@@ -1067,7 +1142,7 @@ def prepare_model(model_config, train_config, runtime_config, context):
             "static_graph": False,
         }
         # Newer PyTorch releases batch gradient copies into each ready bucket.
-        # Keep the notebook usable on Kaggle images with older DDP signatures.
+        # Keep training compatible with older PyTorch DDP signatures.
         if "batched_grad_copy" in inspect.signature(DDP).parameters:
             ddp_kwargs["batched_grad_copy"] = True
         model = DDP(model, **ddp_kwargs)
@@ -1117,22 +1192,23 @@ def ddp_worker(rank, world_size, model_config, train_config, runtime_config, mas
         context.cleanup()
 
 
-_DDP_BOOTSTRAP = r"""
-import cloudpickle
-import os
-
-worker, model_config, train_config, runtime_config, master_port = cloudpickle.load(
-    __import__("sys").stdin.buffer
-)
-worker(
-    int(os.environ["RANK"]),
-    int(os.environ["WORLD_SIZE"]),
+def _ddp_bootstrap(
+    rank,
+    world_size,
+    worker,
     model_config,
     train_config,
     runtime_config,
-    int(master_port),
-)
-"""
+    master_port,
+):
+    worker(
+        rank,
+        world_size,
+        model_config,
+        train_config,
+        runtime_config,
+        master_port,
+    )
 
 
 def train_lgps(model_config, train_config, runtime_config):
@@ -1160,64 +1236,26 @@ def train_lgps(model_config, train_config, runtime_config):
         sock.bind(("127.0.0.1", 0))
         master_port = sock.getsockname()[1]
 
-    # Notebook-defined worker functions capture classes with constant tensors.
-    # Some Kaggle PyTorch builds lazily omit this reducer dependency, causing
-    # cloudpickle to fail with ``torch has no attribute _utils`` before DDP
-    # starts. Import it explicitly before serializing the worker payload.
+    # Load PyTorch's worker reducers before spawning distributed processes.
     importlib.import_module("torch._utils")
-    payload = cloudpickle.dumps(
-        (ddp_worker, model_config, train_config, runtime_config, master_port)
+    mp.spawn(
+        _ddp_bootstrap,
+        args=(
+            world_size,
+            ddp_worker,
+            model_config,
+            train_config,
+            runtime_config,
+            master_port,
+        ),
+        nprocs=world_size,
+        join=True,
     )
-    workers = []
-    try:
-        for rank in range(world_size):
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "MASTER_ADDR": "127.0.0.1",
-                    "MASTER_PORT": str(master_port),
-                    "WORLD_SIZE": str(world_size),
-                    "RANK": str(rank),
-                    "LOCAL_RANK": str(rank),
-                    "PYTHONUNBUFFERED": "1",
-                }
-            )
-            worker = subprocess.Popen(
-                [sys.executable, "-u", "-c", _DDP_BOOTSTRAP],
-                env=environment,
-                stdin=subprocess.PIPE,
-            )
-            workers.append(worker)
-            worker.stdin.write(payload)
-            worker.stdin.close()
-
-        while any(worker.poll() is None for worker in workers):
-            return_codes = [worker.poll() for worker in workers]
-            if any(code is not None and code != 0 for code in return_codes):
-                raise RuntimeError(f"DDP worker failure: return codes {return_codes}")
-            time.sleep(0.1)
-        return_codes = [worker.returncode for worker in workers]
-    except BaseException:
-        for worker in workers:
-            if worker.poll() is None:
-                worker.terminate()
-        for worker in workers:
-            try:
-                worker.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                worker.kill()
-                worker.wait()
-        raise
-
-    if any(return_code != 0 for return_code in return_codes):
-        raise RuntimeError(f"DDP worker failure: return codes {return_codes}")
 
     metrics_path = OUTPUT_DIR / "metrics.json"
+    
     if metrics_path.exists():
         payload = json.loads(metrics_path.read_text(encoding="utf-8"))
         return pl.DataFrame(payload["history"]), payload["latest"]
+    
     return None, None
-
-
-
-
