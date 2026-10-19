@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import math
 import tarfile
+import tempfile
 import cloudpickle
 import numpy as np
 import polars as pl
@@ -156,12 +157,13 @@ def selected_source_columns(available):
     player_columns.update(
         f'player_{slot}_{feature}'
         for slot in slots
-        for feature in ('touching_ball', 'is_touching_ball')
+        for feature in ('touching_ball', 'is_touching_ball', 'id')
         if f'player_{slot}_{feature}' in available
     )
 
     optional = {
-        name for name in ('goal_event_id', 'goal_event_team_id', 'blue_next_goal', 'orange_next_goal',
+        name for name in ('replay_datetime', 'replay_date',
+                          'goal_event_id', 'goal_event_team_id', 'blue_next_goal', 'orange_next_goal',
                           *EVENT_FLAG_COLUMNS)
         if name in available
     }
@@ -302,6 +304,7 @@ def remap_match_roster(frame, selected):
 
         if source is None:
             updates.append(pl.lit(2, dtype=pl.Int64).alias(target_prefix + 'team_id'))
+            updates.append(pl.lit('', dtype=pl.String).alias(target_prefix + 'id'))
             updates.extend(
                 pl.lit(0.0, dtype=pl.Float32).alias(target_prefix + feature)
                 for feature in PLAYER_FEATURES
@@ -311,6 +314,9 @@ def remap_match_roster(frame, selected):
 
         source_prefix = f'player_{source}_'
         updates.append(pl.lit(team, dtype=pl.Int64).alias(target_prefix + 'team_id'))
+        updates.append((pl.col(source_prefix + 'id').cast(pl.String, strict=False)
+                        if source_prefix + 'id' in frame.columns else pl.lit('', dtype=pl.String))
+                       .alias(target_prefix + 'id'))
 
         for feature in PLAYER_FEATURES:
             source_column = source_prefix + feature
@@ -482,6 +488,8 @@ def prepare_replay(
     random_augmentation=False,
     target_sample_rate=TARGET_SAMPLE_RATE,
     inference=False,
+    include_player_ids=False,
+    include_replay_date=False,
 ):
     # Compile one replay with exact targets, dynamic roster mapping, and valid strength states.
     if target_sample_rate <= 0 or target_sample_rate > SOURCE_HZ:
@@ -635,7 +643,12 @@ def prepare_replay(
         if name in frame.columns else pl.lit(False).alias(name)
         for name in EVENT_FLAG_COLUMNS
     )
-    return frame.select(OUTPUT_COLUMNS)
+    columns = OUTPUT_COLUMNS + (tuple(f'player_{slot}_id' for slot in PLAYER_SLOTS)
+                                if include_player_ids else ())
+    if include_replay_date:
+        columns += tuple(name for name in ('replay_datetime', 'replay_date')
+                         if name in frame.columns)
+    return frame.select(columns)
 
 class LGPSScaler:
     # AnalyzeRL-Boxcars uses Rocket League world units, scaled boost in [0, 100],
@@ -893,10 +906,20 @@ class LGPSAgents:
                              )
 
 class LGPSDataSource:
-    def __init__(self, path, model_entities="all", aux_tasks=()):
+    def __init__(self, path, model_entities="all", aux_tasks=(), sample_rate=TARGET_SAMPLE_RATE):
         self.model_entities = normalize_model_entities(model_entities)
         self.aux_tasks = tuple(() if aux_tasks is None else aux_tasks)
         path = Path(path)
+        self._prepared_input = None
+        if source_is_raw(path):
+            self._prepared_input = tempfile.TemporaryDirectory(prefix='lgps-prepared-')
+            try:
+                prepare_dataset(path, self._prepared_input.name,
+                                target_sample_rate=sample_rate)
+            except BaseException:
+                self._prepared_input.cleanup()
+                raise
+            path = Path(self._prepared_input.name)
         if path.is_file():
             candidate_paths = (
                 (path,)
@@ -925,6 +948,11 @@ class LGPSDataSource:
             for candidate in self.paths
         }
         self.total_rows = sum(self.row_counts.values())
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_prepared_input'] = None
+        return state
 
     @staticmethod
     def row_groups_for_path(path):
@@ -1098,7 +1126,7 @@ class LGPSData:
         self.rank = rank
         self.world_size = world_size
         self.source = LGPSDataSource(train_config.input_path, model_config.model_entities,
-                                     train_config.aux_tasks)
+                                     train_config.aux_tasks, model_config.sample_rate)
         self.builder = LGPSAgents(
             model_config.model_entities,
             targets_per_team=model_config.targets_per_team,
@@ -1108,10 +1136,21 @@ class LGPSData:
             aux_tasks=train_config.aux_tasks,
         )
 
-        train_end = int(self.source.total_rows * train_config.train_split)
-        validation_end = int(
-            self.source.total_rows * (train_config.train_split + train_config.val_split)
-        )
+        replays = (pl.concat([pl.scan_parquet(path).select('replay_id')
+                              for path in self.source.paths])
+                   .with_row_index('_row')
+                   .filter(pl.col('replay_id').ne(pl.col('replay_id').shift()).fill_null(True))
+                   .collect(engine='streaming'))
+        if replays['replay_id'].null_count() or replays['replay_id'].n_unique() != replays.height:
+            raise ValueError('replay_id must be non-null and contiguous')
+        boundaries = (*replays['_row'].to_list(), self.source.total_rows)
+        replay_count = len(boundaries) - 1
+        train_count = min(replay_count, int(math.floor(replay_count * train_config.train_split + 0.5)))
+        validation_count = min(replay_count, int(math.floor(
+            replay_count * (train_config.train_split + train_config.val_split) + 0.5
+        )))
+        train_end = boundaries[train_count]
+        validation_end = boundaries[validation_count]
         self.ranges = {
             "train": (0, train_end),
             "validation": (train_end, validation_end),
@@ -1201,3 +1240,29 @@ def prepare_dataset(source, output_dir, *, max_replays=None, target_sample_rate=
         for writer in writers.values():
             writer.close()
     return {split: output_dir / f'{split}.parquet' for split in writers}
+
+
+def source_is_raw(path):
+    # Prepared inputs have model targets; raw replay frames have source frame fields.
+    path = Path(path)
+    if path.is_file():
+        paths = (path,)
+    elif path.is_dir():
+        paths = tuple(sorted(
+            candidate for candidate in path.rglob('*')
+            if candidate.is_file() and candidate.suffix.lower() in ('.parquet', '.tar')
+        ))
+    else:
+        paths = ()
+    if not paths:
+        return False
+    raw = []
+    for candidate in paths:
+        if candidate.suffix.lower() == '.tar':
+            raw.append(True)
+        elif candidate.suffix.lower() == '.parquet':
+            schema = set(pq.ParquetFile(candidate).schema_arrow.names)
+            raw.append({'frame_number', 'frame_is_active', 'stint_id'}.issubset(schema))
+    if any(raw) and not all(raw):
+        raise ValueError('input_path cannot mix raw replay frames with prepared model data')
+    return all(raw)

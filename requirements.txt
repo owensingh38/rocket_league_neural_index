@@ -1,0 +1,16 @@
+analyzerl-boxcars>=0.1.4
+numpy
+polars
+pyarrow
+torch==2.14.0
+onnx
+onnxruntime
+onnxscript
+matplotlib
+scikit-learn
+joblib
+cloudpickle
+wandb
+xgboost
+optuna
+shap
