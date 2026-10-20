@@ -45,8 +45,6 @@ DOUBLE_TAP_BACK_WALL_PROJECTION_SECONDS = 3.5
 WALL_SHOT_DISTANCE = 350.0
 CEILING_SHOT_DISTANCE = 350.0
 
-SHAP_SAMPLE_SIZE = 5_000
-
 EVENT_TYPES = {
     1: 'kickoff', 2: 'game_join', 3: 'game_leave', 4: 'shot', 5: 'save',
     6: 'goal', 7: 'assist', 8: 'pass', 9: 'missed_pass', 10: 'missed_shot',
@@ -2169,18 +2167,12 @@ def to_sparse_matrix(
     return matrix
 
 
-def _sample_feature_matrix(
+def _feature_matrix(
     features: pl.DataFrame,
     feature_columns: Sequence[str],
-    max_rows: int = SHAP_SAMPLE_SIZE,
-    seed: int = RANDOM_STATE,
 ) -> np.ndarray:
     if features.height == 0:
         return np.empty((0, len(feature_columns)), dtype=np.float32)
-    if features.height > max_rows:
-        rng = np.random.default_rng(seed)
-        row_idx = np.sort(rng.choice(features.height, size=max_rows, replace=False))
-        features = features[row_idx]
     columns = []
     for column in feature_columns:
         values = np.array(

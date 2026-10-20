@@ -209,9 +209,9 @@ Because shot and goal events are not necessarily linked in replay data, this mus
 
 Model Metrics, Out-of-Sample Test Data:
 Model Metrics, Out-of-Sample Test Data:
-- Log Loss: 0.278642
-- Brier Score: 0.083843
-- ROC-AUC: 0.901652
+- Log Loss: 0.278890
+- Brier Score: 0.083925
+- ROC-AUC: 0.901462
 
 ### Example Inference
 

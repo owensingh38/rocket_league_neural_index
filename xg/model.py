@@ -12,7 +12,7 @@ import xgboost as xgb
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from scipy import sparse
-from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
+from sklearn.model_selection import GroupShuffleSplit, StratifiedKFold
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -37,7 +37,7 @@ from .dataset import (
     _feature_column_class,
     _feature_column_classes,
     _normalize_segments,
-    _sample_feature_matrix,
+    _feature_matrix,
     _variable_feature_columns,
     load_segment_training_frames,
     load_training_parquet,
@@ -181,7 +181,6 @@ def _study_results(study: optuna.Study) -> pl.DataFrame:
 def _cross_validate(
     matrix: sparse.csr_matrix,
     labels: np.ndarray,
-    groups: np.ndarray,
     cv: int,
     n_iters: int,
     params: Mapping[str, Any] | None,
@@ -192,12 +191,13 @@ def _cross_validate(
     cv_path: Path,
     segment: str,
 ) -> tuple[dict[str, Any], pl.DataFrame]:
-    splits = min(cv, len(np.unique(groups)))
+    class_counts = np.bincount(labels.astype(np.int8), minlength=2)
+    splits = min(cv, int(class_counts.min()))
     if splits < 2:
-        raise ValueError('Cross-validation requires at least two replay groups')
+        raise ValueError('Stratified cross-validation requires at least two rows per outcome')
     folds = list(
-        StratifiedGroupKFold(n_splits=splits, shuffle=True, random_state=seed)
-        .split(np.arange(len(labels)), labels, groups)
+        StratifiedKFold(n_splits=splits, shuffle=True, random_state=seed)
+        .split(np.arange(len(labels)), labels)
     )
     if any(len(np.unique(labels[train_idx])) < 2 for train_idx, _ in folds):
         raise ValueError('A cross-validation training fold contains only one outcome')
@@ -307,46 +307,13 @@ def _write_evaluation(
 
     import shap
 
-    try:
-        explainer = shap.TreeExplainer(model.model)
-        shap_values = explainer.shap_values(shap_matrix)
-    except ValueError as error:
-        print(f'[{segment}] TreeExplainer unavailable; using KernelExplainer ({error})', flush=True)
-        background = shap_matrix[:min(10, len(shap_matrix))]
-        explainer = shap.KernelExplainer(
-            lambda values: model.model.predict_proba(values)[:, 1],
-            background,
-        )
-        shap_values = explainer.shap_values(
-            shap_matrix,
-            nsamples=min(200, shap_matrix.shape[1] * 2 + 1),
-            silent=True,
-        )
-    if isinstance(shap_values, list):
-        shap_values = shap_values[-1]
-    shap_values = np.asarray(shap_values, dtype=np.float32)
+    contributions = model.model.get_booster().predict(
+        xgb.DMatrix(shap_matrix, feature_names=list(feature_columns)),
+        pred_contribs=True,
+    )
+    shap_values = np.asarray(contributions[:, :-1], dtype=np.float32)
     np.save(output / f'shap_values_{segment}.npy', shap_values)
     mean_abs_shap = np.nanmean(np.abs(shap_values), axis=0)
-
-    model_importance = pl.DataFrame({
-        'feature': feature_columns,
-        'column_class': [_feature_column_class(column) for column in feature_columns],
-        'mean_abs_shap': mean_abs_shap,
-        'importance': model.feature_importances_,
-    }).sort('mean_abs_shap', descending=True)
-    _write_csv_when_unlocked(model_importance, output / f'feature_importance_{segment}.csv')
-    top_model_importance = model_importance.head(20).sort('mean_abs_shap')
-    plt.figure(figsize=(10, 7))
-    plt.barh(
-        top_model_importance['feature'].to_list(),
-        top_model_importance['mean_abs_shap'].to_numpy(),
-        color='#2f6f73',
-    )
-    plt.xlabel('Mean absolute SHAP value')
-    plt.title(f'AnalyzeRL xG Feature Importance - {segment}')
-    plt.tight_layout()
-    plt.savefig(output / f'feature_importance_{segment}.png', dpi=160)
-    plt.close()
 
     shap.summary_plot(
         shap_values,
@@ -356,24 +323,12 @@ def _write_evaluation(
         show=False,
     )
     plt.gcf().set_size_inches(10, 8)
-    plt.title(f'AnalyzeRL xG SHAP Summary - {segment}')
+    plt.xlabel('SHAP Value (Impact on Model Output)')
+    plt.ylabel('Feature')
+    plt.gcf().axes[-1].set_ylabel('Feature Value')
+    plt.title(f'AnalyzeRL xG SHAP Summary ({segment.title()})')
     plt.tight_layout()
-    plt.savefig(output / f'feature_importance_summary_{segment}.png', dpi=160)
-    plt.close()
-
-    top_feature = model_importance['feature'][0]
-    shap.dependence_plot(
-        top_feature,
-        shap_values,
-        shap_matrix,
-        feature_names=list(feature_columns),
-        interaction_index='auto',
-        show=False,
-    )
-    plt.gcf().set_size_inches(9, 7)
-    plt.title(f'AnalyzeRL xG SHAP Dependence - {segment}: {top_feature}')
-    plt.tight_layout()
-    plt.savefig(output / f'feature_importance_dependence_{segment}.png', dpi=160)
+    plt.savefig(output / f'shap_summary_{segment}.png', dpi=160)
     plt.close()
 
     false_positive, true_positive, _ = roc_curve(labels, predictions)
@@ -381,9 +336,9 @@ def _write_evaluation(
     plt.figure(figsize=(8, 7))
     plt.plot(false_positive, true_positive, label=f'AUC = {auc:.4f}', color='#2f6f73')
     plt.plot([0, 1], [0, 1], '--', color='#777777')
-    plt.xlabel('False positive rate')
-    plt.ylabel('True positive rate')
-    plt.title(f'AnalyzeRL xG ROC - {segment}')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'AnalyzeRL xG ROC Curve ({segment.title()})')
     plt.legend()
     plt.tight_layout()
     plt.savefig(output / f'roc_auc_{segment}.png', dpi=160)
@@ -400,22 +355,13 @@ def _write_evaluation(
     plt.figure(figsize=(8, 7))
     plt.plot(predicted, observed, 's-', color='#2f6f73', label=segment)
     plt.plot([0, 1], [0, 1], '--', color='#777777', label='Perfect calibration')
-    plt.xlabel('Mean predicted probability')
-    plt.ylabel('Observed goal rate')
-    plt.title(f'AnalyzeRL xG Calibration - {segment}')
+    plt.xlabel('Mean Predicted Probability')
+    plt.ylabel('Observed Goal Rate')
+    plt.title(f'AnalyzeRL xG Calibration Curve ({segment.title()})')
     plt.legend()
     plt.tight_layout()
     plt.savefig(output / f'calibration_{segment}.png', dpi=160)
     plt.close()
-
-
-def _write_csv_when_unlocked(frame: pl.DataFrame, path: Path) -> None:
-    # Write a CSV, tolerating locked generated artifacts on Windows.
-    try:
-        frame.write_csv(path)
-    except OSError:
-        if not path.exists():
-            raise
 
 
 def _train_segment(
@@ -486,7 +432,6 @@ def _train_segment(
     best_params, cv_results = _cross_validate(
         train_matrix,
         labels[train_idx],
-        groups[train_idx],
         cv,
         n_iters,
         params,
@@ -512,7 +457,7 @@ def _train_segment(
         groups[test_idx] if test_features is None
         else test_features['replay_id'].to_numpy()
     )
-    shap_matrix = _sample_feature_matrix(test_eval_features, feature_columns, seed=seed)
+    shap_matrix = _feature_matrix(test_eval_features, feature_columns)
     column_classes = _feature_column_classes(feature_columns)
     cv_results.write_csv(cv_path)
     _write_evaluation(
@@ -546,6 +491,7 @@ def _train_segment(
         'cv_folds': cv,
         'search_iterations': n_iters,
         'early_stopping_rounds': early_stopping_rounds,
+        'cv_strategy': 'stratified',
         'test_log_loss': float(log_loss(test_labels, predictions, labels=[0, 1])),
         'test_brier': float(brier_score_loss(test_labels, predictions)),
         'test_roc_auc': float(roc_auc_score(test_labels, predictions)),
