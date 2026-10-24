@@ -8,11 +8,12 @@ import joblib
 import numpy as np
 import optuna
 import polars as pl
+import re
 import xgboost as xgb
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from scipy import sparse
-from sklearn.model_selection import GroupShuffleSplit, StratifiedKFold
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -22,9 +23,6 @@ from sklearn.metrics import (
 )
 
 from .config import (
-    DEFAULT_MODEL_CONFIG,
-    DEFAULT_RUNTIME_CONFIG,
-    DEFAULT_TRAIN_CONFIG,
     MODEL_FOLDER,
     MODEL_SEGMENTS,
     XGModelConfig,
@@ -34,7 +32,6 @@ from .config import (
 from .dataset import (
     FRAMES_FOLDER,
     RANDOM_STATE,
-    _feature_column_class,
     _feature_column_classes,
     _normalize_segments,
     _feature_matrix,
@@ -181,6 +178,7 @@ def _study_results(study: optuna.Study) -> pl.DataFrame:
 def _cross_validate(
     matrix: sparse.csr_matrix,
     labels: np.ndarray,
+    groups: np.ndarray,
     cv: int,
     n_iters: int,
     params: Mapping[str, Any] | None,
@@ -192,15 +190,32 @@ def _cross_validate(
     segment: str,
 ) -> tuple[dict[str, Any], pl.DataFrame]:
     class_counts = np.bincount(labels.astype(np.int8), minlength=2)
-    splits = min(cv, int(class_counts.min()))
+    positive_groups = len(np.unique(groups[labels == 1]))
+    negative_groups = len(np.unique(groups[labels == 0]))
+    splits = min(cv, int(class_counts.min()), positive_groups, negative_groups)
     if splits < 2:
-        raise ValueError('Stratified cross-validation requires at least two rows per outcome')
-    folds = list(
-        StratifiedKFold(n_splits=splits, shuffle=True, random_state=seed)
-        .split(np.arange(len(labels)), labels)
-    )
-    if any(len(np.unique(labels[train_idx])) < 2 for train_idx, _ in folds):
-        raise ValueError('A cross-validation training fold contains only one outcome')
+        raise ValueError('Replay-grouped cross-validation requires at least two replay groups per outcome')
+    folds = None
+    for fold_count in range(splits, 1, -1):
+        candidates = list(
+            StratifiedGroupKFold(
+                n_splits=fold_count,
+                shuffle=True,
+                random_state=seed,
+            ).split(np.zeros(len(labels)), labels, groups)
+        )
+        valid_folds = all(
+            len(np.unique(labels[train_idx])) == 2
+            and len(np.unique(labels[valid_idx])) == 2
+            and not set(groups[train_idx]).intersection(groups[valid_idx])
+            for train_idx, valid_idx in candidates
+        )
+        if valid_folds:
+            splits = fold_count
+            folds = candidates
+            break
+    if folds is None:
+        raise ValueError('Could not form replay-grouped CV folds containing both outcomes')
     fixed_params = dict(params or {})
 
     def evaluate(candidate, iteration, trial=None):
@@ -252,11 +267,9 @@ def _cross_validate(
         return candidate, results
 
     sampler = optuna.samplers.TPESampler(seed=seed)
-    pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=min(5, n_iters),
-        n_warmup_steps=1,
+    study = optuna.create_study(
+        direction='minimize', sampler=sampler, pruner=optuna.pruners.NopPruner(),
     )
-    study = optuna.create_study(direction='minimize', sampler=sampler, pruner=pruner)
 
     def objective(trial):
         candidate = _suggest_params(trial, fixed_params)
@@ -331,6 +344,30 @@ def _write_evaluation(
     plt.savefig(output / f'shap_summary_{segment}.png', dpi=160)
     plt.close()
 
+    dependence_dir = output / 'dependence'
+    dependence_dir.mkdir(parents=True, exist_ok=True)
+    used_names = set()
+    for feature_index, feature in enumerate(feature_columns):
+        feature_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(feature)).strip('._')
+        feature_name = feature_name or f'feature_{feature_index}'
+        if feature_name in used_names:
+            feature_name = f'{feature_name}_{feature_index}'
+        used_names.add(feature_name)
+        shap.dependence_plot(
+            feature_index,
+            shap_values,
+            shap_matrix,
+            feature_names=list(feature_columns),
+            interaction_index=feature,
+            show=False,
+            alpha=0.6,
+        )
+        plt.gcf().set_size_inches(7, 5)
+        plt.title(f'{segment.title()} SHAP Dependence: {feature}')
+        plt.tight_layout()
+        plt.savefig(dependence_dir / f'dependence_{segment}_{feature_name}.png', dpi=120)
+        plt.close()
+
     false_positive, true_positive, _ = roc_curve(labels, predictions)
     auc = roc_auc_score(labels, predictions)
     plt.figure(figsize=(8, 7))
@@ -380,7 +417,6 @@ def _train_segment(
     include_prior_event_history: bool = False,
     test_frames: pl.DataFrame | None = None,
 ) -> dict[str, Any]:
-    print(f'[{segment}] preparing model features from {frames.height:,} shots', flush=True)
     features = frames if prepared else prepare_model_data(
         frames,
         include_prior_event_history=include_prior_event_history,
@@ -389,10 +425,9 @@ def _train_segment(
     groups = features['replay_id'].to_numpy()
     if features.height < 20 or len(np.unique(labels)) < 2:
         raise ValueError(f'{segment} does not contain enough shot outcomes to train')
-    test_features = (
-        None if test_frames is None
-        else test_frames if prepared
-        else prepare_model_data(test_frames, include_prior_event_history=include_prior_event_history)
+    test_features = None if test_frames is None else prepare_model_data(
+        test_frames,
+        include_prior_event_history=include_prior_event_history,
     )
     if test_features is None:
         train_idx, test_idx = _grouped_split(labels, groups, train_test_split_pct, seed)
@@ -410,12 +445,6 @@ def _train_segment(
         features[train_idx],
         candidate_columns,
     )
-    print(
-        f'[{segment}] retained {len(feature_columns):,}/{len(candidate_columns):,} features; '
-        f'removed {len(removed_constant_features):,} single-valued columns',
-        flush=True,
-    )
-    print(f'[{segment}] building sparse train/test matrices', flush=True)
     train_matrix = to_sparse_matrix(features[train_idx], feature_columns)
     test_matrix = to_sparse_matrix(
         features[test_idx] if test_features is None else test_features,
@@ -424,14 +453,10 @@ def _train_segment(
     output = Path(directory) / segment
     output.mkdir(parents=True, exist_ok=True)
     cv_path = output / f'cross_validation_{segment}.csv'
-    print(
-        f'[{segment}] starting {cv}-fold CV with '
-        f'{max(1, n_iters)} trial(s) on {"GPU" if gpu else "CPU"}',
-        flush=True,
-    )
     best_params, cv_results = _cross_validate(
         train_matrix,
         labels[train_idx],
+        groups[train_idx],
         cv,
         n_iters,
         params,
@@ -441,10 +466,6 @@ def _train_segment(
         early_stopping_rounds,
         cv_path,
         segment,
-    )
-    print(
-        f'[{segment}] fitting final model with {best_params["n_estimators"]} trees',
-        flush=True,
     )
     model = AnalyzeRLxG(best_params, seed, jobs, gpu).fit(train_matrix, labels[train_idx])
     predictions = model.predict_proba(test_matrix)[:, 1]
@@ -491,7 +512,7 @@ def _train_segment(
         'cv_folds': cv,
         'search_iterations': n_iters,
         'early_stopping_rounds': early_stopping_rounds,
-        'cv_strategy': 'stratified',
+        'cv_strategy': 'stratified_group',
         'test_log_loss': float(log_loss(test_labels, predictions, labels=[0, 1])),
         'test_brier': float(brier_score_loss(test_labels, predictions)),
         'test_roc_auc': float(roc_auc_score(test_labels, predictions)),
@@ -505,8 +526,8 @@ def _train_segment(
         'feature_columns': feature_columns,
         'column_classes': column_classes,
         'model_segment': segment,
+        'include_prior_event_history': include_prior_event_history,
     }, output / f'xg_model_{segment}.joblib')
-    print(f'[{segment}] model and evaluation artifacts written to {output}', flush=True)
     return metrics
 
 
@@ -517,7 +538,7 @@ def analyzerl_xg(
     model_segments: Sequence[str] | str | None = MODEL_SEGMENTS,
     limit: int | None = None,
     cv: int = 5,
-    n_iters: int = 25,
+    n_iters: int = 30,
     train_test_split_pct: float = 0.8,
     jobs: int | None = None,
     params: Mapping[str, Any] | None = None,
@@ -569,10 +590,10 @@ def analyzerl_xg(
         raise ValueError('n_iters cannot be negative')
     if early_stopping_rounds <= 0:
         raise ValueError('early_stopping_rounds must be a positive integer')
+    print('Training RL xG model(s)...', flush=True)
     results = []
     for segment in segments:
         # Load, train, and release one mode before scanning data for the next mode.
-        print(f'[{segment}] loading training replays', flush=True)
         prepared = training_parquet is not None
         segment_train_paths = (
             train_frame_paths.get(segment)
@@ -613,7 +634,6 @@ def analyzerl_xg(
                 selected_replay_ids=test_replay_ids,
             )
         if segment_frames.is_empty():
-            print(f'[{segment}] no matching shot events; skipping', flush=True)
             continue
         if test_segment_frames is not None and test_segment_frames.is_empty():
             raise ValueError(f'{segment} has no shot events in the configured LGPS test source')
@@ -639,9 +659,9 @@ def analyzerl_xg(
             if test_segment_frames is not None:
                 del test_segment_frames
             gc.collect()
-            print(f'[{segment}] released segment training memory', flush=True)
     if not results:
         raise ValueError('No shot events matched the requested model_segments')
+    print('Finished RL xG Model(s).', flush=True)
     return pl.DataFrame(results)
 
 

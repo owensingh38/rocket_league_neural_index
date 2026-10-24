@@ -21,7 +21,7 @@ class XGTrainConfig:
     model_segments: tuple[str, ...] = MODEL_SEGMENTS
     replay_limit: int | None = None
     cv_folds: int = 5
-    search_iterations: int = 25
+    search_iterations: int = 30
     train_test_split_pct: float = 0.8
     early_stopping_rounds: int = 50
     include_prior_event_history: bool = False

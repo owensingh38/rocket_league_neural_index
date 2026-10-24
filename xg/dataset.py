@@ -692,9 +692,20 @@ def _near_offensive_back_wall(event: Mapping[str, Any], team: str) -> bool:
     ball_vz = event.get('ball_vel_z')
     if any(value is None or not np.isfinite(value) for value in (ball_x, ball_z, ball_vx, ball_vz)):
         return False
-    projected_x = ball_x + ball_vx * time_to_wall
-    projected_z = ball_z + ball_vz * time_to_wall - 0.5 * GRAVITY * time_to_wall ** 2
-    return abs(projected_x) <= SIDE_WALL_X and 0.0 <= projected_z <= CEILING_Z
+    projected_x, projected_y, projected_z = _project_ball_with_bounces(
+        np.asarray([ball_x]),
+        np.asarray([ball_y]),
+        np.asarray([ball_z]),
+        np.asarray([ball_vx]),
+        np.asarray([ball_vy]),
+        np.asarray([ball_vz]),
+        np.asarray([time_to_wall]),
+    )
+    return (
+        abs(projected_y[0] - offensive_y) <= 1.0
+        and abs(projected_x[0]) <= SIDE_WALL_X - BALL_RADIUS
+        and BALL_RADIUS <= projected_z[0] <= CEILING_Z - BALL_RADIUS
+    )
 
 
 def _event_context_features(timeline: pl.DataFrame, shots: pl.DataFrame) -> pl.DataFrame:
@@ -1406,11 +1417,116 @@ def _ball_at_time(
     ball_vz: np.ndarray,
     seconds: np.ndarray,
 ) -> tuple[np.ndarray, ...]:
-    return (
-        ball_x + ball_vx * seconds,
-        ball_y + ball_vy * seconds,
-        np.maximum(ball_z + ball_vz * seconds - 0.5 * GRAVITY * np.square(seconds), 0.0),
+    projected_x, projected_y, projected_z = _project_ball_with_bounces(
+        ball_x, ball_y, ball_z, ball_vx, ball_vy, ball_vz, seconds,
     )
+    return (
+        projected_x,
+        projected_y,
+        projected_z,
+    )
+
+
+def _project_ball_with_bounces(
+    ball_x: np.ndarray,
+    ball_y: np.ndarray,
+    ball_z: np.ndarray,
+    ball_vx: np.ndarray,
+    ball_vy: np.ndarray,
+    ball_vz: np.ndarray,
+    seconds: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Advance a 3D ball path with side/end-wall, floor, and ceiling rebounds."""
+    x = np.asarray(ball_x, dtype=np.float64).copy()
+    y = np.asarray(ball_y, dtype=np.float64).copy()
+    z = np.asarray(ball_z, dtype=np.float64).copy()
+    vx = np.asarray(ball_vx, dtype=np.float64).copy()
+    vy = np.asarray(ball_vy, dtype=np.float64).copy()
+    vz = np.asarray(ball_vz, dtype=np.float64).copy()
+    remaining = np.maximum(np.asarray(seconds, dtype=np.float64), 0.0).copy()
+    scored = np.zeros(remaining.shape, dtype=bool)
+    x_limit = SIDE_WALL_X - BALL_RADIUS
+    y_limit = BACK_WALL_Y
+    z_floor = BALL_RADIUS
+    z_ceiling = CEILING_Z - BALL_RADIUS
+    gravity = float(GRAVITY)
+    z = np.clip(z, z_floor, z_ceiling)
+    grounded = (z <= z_floor + 1e-6) & (np.abs(vz) <= 1e-9)
+    vz = np.where(grounded, 0.0, vz)
+
+    for _ in range(32):
+        active = remaining > 1e-9
+        if not np.any(active):
+            break
+
+        tx = np.full(remaining.shape, np.inf, dtype=np.float64)
+        tx = np.where(vx > 1e-9, (x_limit - x) / vx, tx)
+        tx = np.where(vx < -1e-9, (-x_limit - x) / vx, tx)
+        ty = np.full(remaining.shape, np.inf, dtype=np.float64)
+        ty = np.where(vy > 1e-9, (y_limit - y) / vy, ty)
+        ty = np.where(vy < -1e-9, (-y_limit - y) / vy, ty)
+        tx = np.where((tx >= -1e-9) & active, np.maximum(tx, 0.0), np.inf)
+        ty = np.where((ty >= -1e-9) & active & ~scored, np.maximum(ty, 0.0), np.inf)
+
+        # The upper-wall equation has a real root only when the ball's apex
+        # reaches the ceiling. Use the ascending root so rebounds happen at
+        # the first contact, not at a fictitious later crossing.
+        top_discriminant = vz * vz - 2.0 * gravity * (z_ceiling - z)
+        top_root = (vz - np.sqrt(np.maximum(top_discriminant, 0.0))) / gravity
+        top_contact = (top_root > 1e-9) | ((z >= z_ceiling - 1e-6) & (vz > 1e-9))
+        tz_top = np.where(
+            (top_discriminant >= 0.0) & top_contact & active,
+            np.maximum(top_root, 0.0),
+            np.inf,
+        )
+        floor_discriminant = vz * vz + 2.0 * gravity * (z - z_floor)
+        floor_root = (vz + np.sqrt(np.maximum(floor_discriminant, 0.0))) / gravity
+        floor_contact = (floor_root > 1e-9) | ((z <= z_floor + 1e-6) & (vz < -1e-9))
+        tz_floor = np.where(
+            (floor_discriminant >= 0.0) & floor_contact & ~grounded & active,
+            np.maximum(floor_root, 0.0),
+            np.inf,
+        )
+
+        first_hit = np.minimum.reduce([tx, ty, tz_top, tz_floor])
+        has_hit = active & (first_hit <= remaining)
+        advance = np.where(has_hit, first_hit, remaining)
+        x += vx * advance
+        y += vy * advance
+        airborne = ~grounded
+        z += np.where(airborne, vz * advance - 0.5 * gravity * np.square(advance), 0.0)
+        vz -= np.where(airborne, gravity * advance, 0.0)
+        remaining = np.where(active, np.maximum(remaining - advance, 0.0), remaining)
+
+        # Compare bounds directly so inf - inf does not emit invalid-value
+        # warnings for axes that do not collide during this step.
+        hit_x = has_hit & (tx <= first_hit + 1e-8) & (tx >= first_hit - 1e-8)
+        hit_y = has_hit & (ty <= first_hit + 1e-8) & (ty >= first_hit - 1e-8)
+        hit_top = has_hit & (tz_top <= first_hit + 1e-8) & (tz_top >= first_hit - 1e-8)
+        hit_floor = has_hit & (tz_floor <= first_hit + 1e-8) & (tz_floor >= first_hit - 1e-8)
+
+        # End walls have an opening. A ball crossing within the posts and
+        # under the bar enters the goal instead of rebounding into the field.
+        goal_opening = (
+            (np.abs(x) <= GOAL_CENTER_TO_POST - BALL_RADIUS)
+            & (z >= BALL_RADIUS)
+            & (z <= GOAL_HEIGHT - BALL_RADIUS)
+        )
+        goal_crossing = hit_y & goal_opening
+        scored |= goal_crossing
+        hit_y &= ~goal_opening
+
+        vx = np.where(hit_x, -vx, vx)
+        vy = np.where(hit_y, -vy, vy)
+        vz = np.where(hit_top, -np.abs(vz), vz)
+        vz = np.where(hit_floor, np.abs(vz), vz)
+        grounded = np.where(hit_floor, vz <= 1e-9, grounded)
+        x = np.where(hit_x, np.sign(x) * x_limit, x)
+        y = np.where(hit_y, np.sign(y) * y_limit, y)
+        z = np.where(hit_top, z_ceiling, z)
+        z = np.where(hit_floor, z_floor, z)
+
+    return x.astype(np.float32), y.astype(np.float32), z.astype(np.float32)
 
 
 def _shot_path(
@@ -1431,6 +1547,7 @@ def _shot_path(
     end_x, end_y, end_z = _ball_at_time(
         ball_x, ball_y, ball_z, ball_vx, ball_vy, ball_vz, end_time,
     )
+    valid &= np.abs(end_y - GOAL_PLANE_Y) <= 1.0
     return end_time, end_x, end_y, end_z, valid
 
 
@@ -1469,6 +1586,32 @@ def _trajectory_intercept(
     has_dodge = np.asarray(player_has_dodge, dtype=bool)
     active = valid_path & np.isfinite(player_speed) & np.isfinite(player_yaw)
     boost_needed_at_intercept = np.full(row_count, np.nan, dtype=np.float32)
+    positive_goal_time = _safe_divide(GOAL_PLANE_Y - ball_y, ball_vy)
+    positive_goal_x, _, positive_goal_z = _project_ball_with_bounces(
+        ball_x, ball_y, ball_z, ball_vx, ball_vy, ball_vz, positive_goal_time,
+    )
+    negative_goal_time = _safe_divide(-GOAL_PLANE_Y - ball_y, ball_vy)
+    negative_goal_x, _, negative_goal_z = _project_ball_with_bounces(
+        ball_x, ball_y, ball_z, ball_vx, ball_vy, ball_vz, negative_goal_time,
+    )
+    positive_score = (
+        (positive_goal_time > 0.0)
+        & (np.abs(positive_goal_x) <= GOAL_CENTER_TO_POST - BALL_RADIUS)
+        & (positive_goal_z >= BALL_RADIUS)
+        & (positive_goal_z <= GOAL_HEIGHT - BALL_RADIUS)
+    )
+    negative_score = (
+        (negative_goal_time > 0.0)
+        & (np.abs(negative_goal_x) <= GOAL_CENTER_TO_POST - BALL_RADIUS)
+        & (negative_goal_z >= BALL_RADIUS)
+        & (negative_goal_z <= GOAL_HEIGHT - BALL_RADIUS)
+    )
+    score_time = np.where(
+        positive_score & negative_score,
+        np.minimum(positive_goal_time, negative_goal_time),
+        np.where(positive_score, positive_goal_time, negative_goal_time),
+    )
+    scores_on_path = positive_score | negative_score
     for sample in range(1, TRAJECTORY_SAMPLES + 1):
         seconds = horizon * (sample / TRAJECTORY_SAMPLES)
         target_x, target_y, target_z = _ball_at_time(
@@ -1543,7 +1686,8 @@ def _trajectory_intercept(
             planar_distance,
             np.maximum(arrival_speed, CAR_MIN_INTERCEPT_SPEED),
         )
-        sample_valid = active & np.isfinite(distance) & np.isfinite(arrival)
+        before_goal = ~scores_on_path | (seconds < score_time)
+        sample_valid = active & before_goal & np.isfinite(distance) & np.isfinite(arrival)
         min_distance = np.where(
             sample_valid & (~np.isfinite(min_distance) | (distance < min_distance)),
             distance,
@@ -1835,8 +1979,9 @@ def prepare_model_data(
     goal_dy = GOAL_PLANE_Y - ball_y
     goal_distance = np.sqrt(np.square(goal_dx) + np.square(goal_dy))
     time_to_goal = _safe_divide(goal_dy, ball_vy)
-    projected_x = ball_x + ball_vx * time_to_goal
-    projected_z = ball_z + ball_vz * time_to_goal - 325.0 * np.square(time_to_goal)
+    projected_x, projected_y, projected_z = _project_ball_with_bounces(
+        ball_x, ball_y, ball_z, ball_vx, ball_vy, ball_vz, time_to_goal,
+    )
     shot_path_time, shot_end_x, shot_end_y, shot_end_z, shot_path_valid = _shot_path(
         ball_x,
         ball_y,
@@ -1888,9 +2033,11 @@ def prepare_model_data(
         'ball_goal_angle': np.arctan2(np.abs(goal_dx), np.maximum(goal_dy, 1.0)),
         'ball_goal_elevation': np.arctan2(ball_z, np.maximum(goal_distance, 1.0)),
         'ball_projected_x': projected_x,
+        'ball_projected_y': projected_y,
         'ball_projected_z': projected_z,
         'ball_projected_inside_goal': (
             (time_to_goal > 0.0)
+            & (np.abs(projected_y - GOAL_PLANE_Y) <= 1.0)
             & (np.abs(projected_x) <= GOAL_CENTER_TO_POST - BALL_RADIUS)
             & (projected_z >= BALL_RADIUS)
             & (projected_z <= GOAL_HEIGHT - BALL_RADIUS)

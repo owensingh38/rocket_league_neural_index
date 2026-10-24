@@ -208,10 +208,9 @@ Using the frame that a shot is recorded in replay frame data, the touch initiati
 Because shot and goal events are not necessarily linked in replay data, this must be done heuristically.  These events are linked by looking back 120 frames (four seconds in our 30hz replay frames data) from the frame the goal is recorded and identifying an evaluated shot row in that interval, selecting the most recent shot by the goal scorer.
 
 Model Metrics, Out-of-Sample Test Data:
-Model Metrics, Out-of-Sample Test Data:
-- Log Loss: 0.278890
-- Brier Score: 0.083925
-- ROC-AUC: 0.901462
+- Log Loss: 0.277829
+- Brier Score: 0.083646
+- ROC-AUC: 0.902553
 
 ### Example Inference
 

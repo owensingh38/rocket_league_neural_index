@@ -39,6 +39,7 @@ def apply_xg(path: str | Path, model_path: str | Path = MODEL_PATH,
     artifact = joblib.load(model_path)
     columns = artifact["feature_columns"]
     model = artifact["model"]
+    include_prior_event_history = artifact.get("include_prior_event_history", False)
 
     outputs = []
     for source in _input_paths(path, output_dir):
@@ -56,7 +57,10 @@ def apply_xg(path: str | Path, model_path: str | Path = MODEL_PATH,
                 if missing_raw:
                     raise ValueError(f"{source}: missing model features and shot columns: "
                                      f"{sorted(missing_raw)}")
-                features = prepare_model_data(frame)
+                features = prepare_model_data(
+                    frame,
+                    include_prior_event_history=include_prior_event_history,
+                )
                 missing_features = set(columns) - set(features.columns)
                 if missing_features:
                     raise ValueError(f"{source}: model features unavailable after preparation: "
