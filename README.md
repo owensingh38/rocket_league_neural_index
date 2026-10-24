@@ -1,5 +1,7 @@
 # Rocket League Neural Index
 
+### Fine-Grained Evaluation of Human Gameplay Behaviours in Rocket League
+
 Training Data: 
 Rocket League replays collected from the following seasons and parsed with the [AnalyzeRL Boxcars library](https://pypi.org/project/analyzerl-boxcars):
 - 2021-22

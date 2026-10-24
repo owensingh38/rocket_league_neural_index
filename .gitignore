@@ -14,3 +14,8 @@ __pycache__
 *.pt
 *.pt.tch.json
 *.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+results/xg/standard/xg_model_standard.joblib
