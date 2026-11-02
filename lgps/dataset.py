@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-import io
+import hashlib
+import json
 import math
+import os
+import shutil
 import tarfile
 import tempfile
-import cloudpickle
+import time
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 from pathlib import Path
 from torch.utils.data import DataLoader, IterableDataset
 from props import (
@@ -29,13 +34,10 @@ from props import (
     normalize_model_entities,
 )
 from .targets import build_frame_batch
-from .aux_tasks import LGPSBallStateAux, LGPSNextTouchAux, LGPSPlayerStateAux
+from .camera import camera_histories
+from .config import normalize_lgps_train_config
 
-GOAL_STATE_COLUMNS = (
-    "blue_goal_in_next_ten_seconds",
-    "orange_goal_in_next_ten_seconds",
-    "neither_goal_in_next_ten_seconds",
-)
+GOAL_LABEL_COLUMNS = ('blue_goal_next', 'orange_goal_next')
 BOOST_POSITIONS = np.asarray([
     (-3072,-4096),(3072,-4096),(-3584,0),(3584,0),(-3072,4096),(3072,4096),
     (-1792,-4184),(0,-4240),(1792,-4184),(-940,-3308),(940,-3308),(0,-2816),
@@ -47,19 +49,17 @@ BOOST_POSITIONS = np.asarray([
 TARGET_SAMPLE_RATE = 10.0
 SOURCE_HZ = 30.0
 RECORD_BATCH_ROWS = 65_536
-WRITE_BATCH_ROWS = 131_072
+WRITE_BATCH_ROWS = 1_048_576
+PREPARED_CACHE_VERSION = 2
 EVENT_FLAG_COLUMNS = ('kickoff_in_progress', 'goal_in_progress')
 
 OUTPUT_COLUMNS = (
     'replay_id',
-    '_window_id',
+    'frame_number',
+    'stint_id',
     '_source_time',
-    '_touching_ball_slot',
-    '_is_touching_ball',
-    '_next_touch_slot',
-    '_next_touch_seconds',
     'time_until_next_goal',
-    *GOAL_STATE_COLUMNS,
+    *GOAL_LABEL_COLUMNS,
     *CONTEXT_FEATURES,
     *BALL_FEATURES,
     *(
@@ -67,6 +67,7 @@ OUTPUT_COLUMNS = (
         for slot in PLAYER_SLOTS
         for field in (
             f'player_{slot}_team_id',
+            f'player_{slot}_id',
             *(f'player_{slot}_{feature}' for feature in PLAYER_FEATURES),
             f'player_{slot}_touching_ball',
         )
@@ -77,10 +78,17 @@ OUTPUT_COLUMNS = (
     'random_augmentation',
 )
 
-def split_for_source(source_name: str) -> str:
-    parts = str(source_name).replace('\\', '/').lower().split('/')
-    return 'test' if any(part == '2026' or part.startswith('2026.') for part in parts) else 'train'
+PLAYER_CAMERA_FIELDS = (
+    'camera_fov', 'camera_height', 'camera_angle', 'camera_distance',
+    'camera_stiffness', 'camera_swivel', 'camera_transition',
+    'camera_using_secondary_camera', 'camera_using_behind_view', 'camera_using_swivel',
+    'camera_frame_pitch', 'camera_frame_yaw',
+)
 
+PLAYER_CORE_FEATURES = (
+    'pos_x', 'pos_y', 'pos_z', 'vel_x', 'vel_y', 'vel_z',
+    'ang_vel_x', 'ang_vel_y', 'ang_vel_z', 'rot_x', 'rot_y', 'rot_z', 'rot_w',
+)
 
 def iter_parquets(root: Path):
     # Iterate through Parquet files and archive members one at a time.
@@ -106,14 +114,7 @@ def iter_parquets(root: Path):
                     if member.isfile() and member.name.endswith('_frames.parquet'):
                         stream = bundle.extractfile(member)
                         if stream is not None:
-                            yield f'{path}/{member.name}', pq.ParquetFile(io.BytesIO(stream.read()))
-
-
-PLAYER_CORE_FEATURES = (
-    'pos_x', 'pos_y', 'pos_z', 'vel_x', 'vel_y', 'vel_z',
-    'ang_vel_x', 'ang_vel_y', 'ang_vel_z', 'rot_x', 'rot_y', 'rot_z', 'rot_w',
-)
-
+                            yield f'{path}/{member.name}', pq.ParquetFile(stream)
 
 def source_player_slots(available):
     # Return physical source slots, excluding metadata-only ghost slots.
@@ -132,7 +133,7 @@ def source_player_slots(available):
     )
 
 
-def selected_source_columns(available):
+def selected_source_columns(available, include_player_camera=False):
     # Project causal fields and every usable source-player stream.
     required = {
         'replay_id', 'frame_number', 'frame_delta', 'frame_seconds_elapsed', 'frame_is_active', 'stint_id',
@@ -160,10 +161,16 @@ def selected_source_columns(available):
         for feature in ('touching_ball', 'is_touching_ball', 'id')
         if f'player_{slot}_{feature}' in available
     )
+    if include_player_camera:
+        player_columns.update(
+            f'player_{slot}_{feature}'
+            for slot in slots for feature in PLAYER_CAMERA_FIELDS
+            if f'player_{slot}_{feature}' in available
+        )
 
     optional = {
         name for name in ('replay_datetime', 'replay_date',
-                          'goal_event_id', 'goal_event_team_id', 'blue_next_goal', 'orange_next_goal',
+                          'goal_event_id', 'goal_event_team_id',
                           *EVENT_FLAG_COLUMNS)
         if name in available
     }
@@ -179,8 +186,13 @@ def iter_replays(parquet, columns):
     completed = set()
     for batch in parquet.iter_batches(batch_size=RECORD_BATCH_ROWS, columns=columns):
         frame = pl.from_arrow(batch)
-        for replay_id in frame['replay_id'].unique(maintain_order=True).to_list():
-            part = frame.filter(pl.col('replay_id') == replay_id)
+        replay_ids = frame['replay_id'].to_numpy()
+        if replay_ids.size == 0:
+            continue
+        boundaries = np.r_[0, np.flatnonzero(replay_ids[1:] != replay_ids[:-1]) + 1, replay_ids.size]
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            replay_id = replay_ids[start]
+            part = frame.slice(int(start), int(stop - start))
             if pending is not None and replay_id == pending['replay_id'][0]:
                 pending = pl.concat((pending, part), how='vertical_relaxed')
             else:
@@ -209,9 +221,9 @@ def goal_rows_and_teams(frame):
         event_ids = frame['goal_event_id'].cast(pl.String, strict=False).fill_null('').to_numpy()
         teams = frame['goal_event_team_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
         rows = (event_ids != '') & np.isin(teams, (0, 1))
-        rows[1:] &= (event_ids[1:] != event_ids[:-1]) | ~rows[:-1]
-
-        return rows, teams.astype(np.int8, copy=False)
+        if rows.any():
+            rows[1:] &= (event_ids[1:] != event_ids[:-1]) | ~rows[:-1]
+            return rows, teams.astype(np.int8, copy=False)
 
     blue = numeric(frame, 'blue_team_score', np.nan)
     orange = numeric(frame, 'orange_team_score', np.nan)
@@ -272,16 +284,22 @@ def resolve_match_roster(frame):
 
     blue_strength = sum(active_by_slot[slot].astype(np.int8) for slot in strength_slots[0])
     orange_strength = sum(active_by_slot[slot].astype(np.int8) for slot in strength_slots[1])
-    invalid = (
-        ((blue_strength == 4) & (orange_strength == 3))
-        | ((blue_strength == 3) & (orange_strength == 4))
-        | ((blue_strength == 4) & (orange_strength == 4))
+    valid_strength = (
+        (blue_strength >= 1) & (blue_strength <= MAX_PLAYERS_PER_TEAM)
+        & (orange_strength >= 1) & (orange_strength <= MAX_PLAYERS_PER_TEAM)
     )
-    return selected, ~invalid
+    return selected, valid_strength
 
 
-def remap_match_roster(frame, selected):
+def remap_match_roster(frame, selected, include_player_camera=False):
     # Map dynamic source slots to the model’s stable blue-then-orange six slots.
+    camera_fallbacks = {
+        'camera_fov': 110.0, 'camera_height': 100.0, 'camera_angle': -3.0,
+        'camera_distance': 270.0, 'camera_stiffness': 0.5, 'camera_swivel': 5.0,
+        'camera_transition': 1.2, 'camera_using_secondary_camera': 0.0,
+        'camera_using_behind_view': 0.0, 'camera_using_swivel': 0.0,
+        'camera_frame_pitch': 128.0, 'camera_frame_yaw': 128.0,
+    }
     missing_contact = [source for team in (0, 1) for source in selected[team]
                        if not any(f'player_{source}_{feature}' in frame.columns
                                   for feature in ('touching_ball', 'is_touching_ball'))
@@ -310,6 +328,9 @@ def remap_match_roster(frame, selected):
                 for feature in PLAYER_FEATURES
             )
             updates.append(pl.lit(False).alias(target_prefix + 'touching_ball'))
+            if include_player_camera:
+                updates.extend(pl.lit(0.0, dtype=pl.Float32).alias(target_prefix + field)
+                               for field in PLAYER_CAMERA_FIELDS)
             continue
 
         source_prefix = f'player_{source}_'
@@ -324,6 +345,14 @@ def remap_match_roster(frame, selected):
                 updates.append(pl.col(source_column).alias(target_prefix + feature))
             else:
                 updates.append(pl.lit(0.0, dtype=pl.Float32).alias(target_prefix + feature))
+        if include_player_camera:
+            for field in PLAYER_CAMERA_FIELDS:
+                source_column = source_prefix + field
+                fallback = camera_fallbacks[field]
+                updates.append((pl.col(source_column).cast(pl.Float32, strict=False)
+                                .forward_fill().fill_null(fallback)
+                                if source_column in frame.columns else pl.lit(fallback, dtype=pl.Float32))
+                               .alias(target_prefix + field))
         contact_column = next((source_prefix + feature for feature in
                                ('touching_ball', 'is_touching_ball')
                                if source_prefix + feature in frame.columns), None)
@@ -483,12 +512,24 @@ def apply_random_augmentation(frame):
     return frame.with_columns(updates)
 
 
+def randomize_prepared_replay(frame):
+    # Choose one field orientation per stint, then rotate cached replay data.
+    stints = frame['stint_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
+    _, group = np.unique(stints, return_inverse=True)
+    selected = (np.random.random(group.max() + 1) < 0.5)[group]
+    columns = frame.columns
+    transformed = apply_random_augmentation(frame.with_columns(
+        pl.Series('random_augmentation', selected)
+    ))
+    return transformed.select(columns)
+
+
 def prepare_replay(
     frame,
     random_augmentation=False,
     target_sample_rate=TARGET_SAMPLE_RATE,
     inference=False,
-    include_player_ids=False,
+    include_player_camera=False,
     include_replay_date=False,
 ):
     # Compile one replay with exact targets, dynamic roster mapping, and valid strength states.
@@ -497,68 +538,42 @@ def prepare_replay(
     step = int(round(SOURCE_HZ / target_sample_rate))
     if not np.isclose(step * target_sample_rate, SOURCE_HZ):
         raise ValueError('target_sample_rate must evenly divide the 30 Hz source')
-    frame = frame.sort('frame_number')
     frame_numbers = frame['frame_number'].cast(pl.Int64).to_numpy()
 
-    if np.any(np.diff(frame_numbers) <= 0):
-        raise ValueError('frame_number must be strictly increasing within a replay')
+    frame_steps = np.diff(frame_numbers)
+    if np.any(frame_steps <= 0):
+        frame = frame.sort('frame_number')
+        frame_numbers = frame['frame_number'].cast(pl.Int64).to_numpy()
+        if np.any(np.diff(frame_numbers) <= 0):
+            raise ValueError('frame_number must be strictly increasing within a replay')
     selected, valid_strength = resolve_match_roster(frame)
-    frame = remap_match_roster(frame, selected)
+    frame = remap_match_roster(frame, selected, include_player_camera=include_player_camera)
 
     source_time = np.cumsum(numeric(frame, 'frame_delta', 0.0), dtype=np.float64)
     goal_row, teams = goal_rows_and_teams(frame)
     stints = frame['stint_id'].cast(pl.Int64, strict=False).fill_null(-1).to_numpy()
-    contact_columns = tuple(f'player_{slot}_touching_ball' for slot in PLAYER_SLOTS)
-    contact = frame.select(contact_columns).to_numpy().astype(bool)
-    touching_ball_slot = np.where(contact.sum(axis=1) == 1, contact.argmax(axis=1), -1)
-    next_touch_slot = np.full(frame.height, -1, dtype=np.int64)
-    next_touch_seconds = np.full(frame.height, np.nan, dtype=np.float32)
-    # A continuous contact run is one touch event, not one new touch per frame.
-    previous = np.r_[-1, touching_ball_slot[:-1]]
-    events = np.flatnonzero((touching_ball_slot >= 0)
-                           & ((touching_ball_slot != previous)
-                              | np.r_[True, stints[1:] != stints[:-1]]))
-    following = np.searchsorted(events, np.arange(frame.height), side='right')
-    found = following < events.size
-    rows = np.flatnonzero(found)
-    future = events[following[rows]]
-    same_stint = stints[rows] == stints[future]
-    rows, future = rows[same_stint], future[same_stint]
-    next_touch_slot[rows] = touching_ball_slot[future]
-    next_touch_seconds[rows] = (source_time[future] - source_time[rows]).astype(np.float32)
     goal_time = np.full(frame.height, np.nan, dtype=np.float64)
     goal_team = np.full(frame.height, -1, dtype=np.int8)
-    scoring_stints = set()
-    for stint in np.unique(stints):
-        rows = np.flatnonzero(stints == stint)
-        goals = rows[goal_row[rows]]
-        if goals.size:
-            goal_time[rows] = source_time[goals[0]]
-            goal_team[rows] = teams[goals[0]]
-            scoring_stints.add(stint)
-    time_until_goal = goal_time - source_time
-    within_ten_seconds = np.isfinite(time_until_goal) & (time_until_goal > 0.0) & (time_until_goal <= 10.0)
-    blue_target = within_ten_seconds & (goal_team == 0)
-    orange_target = within_ten_seconds & (goal_team == 1)
-
+    _, stint_group = np.unique(stints, return_inverse=True)
+    first_goal = np.full(stint_group.max() + 1, frame.height, dtype=np.int64)
+    goal_indices = np.flatnonzero(goal_row)
+    np.minimum.at(first_goal, stint_group[goal_indices], goal_indices)
+    row_goal = first_goal[stint_group]
+    has_goal = row_goal < frame.height
+    goal_time[has_goal] = source_time[row_goal[has_goal]]
+    goal_team[has_goal] = teams[row_goal[has_goal]]
     if inference:
         goal_time.fill(np.nan)
-        blue_target.fill(False)
-        orange_target.fill(False)
+        goal_team.fill(-1)
+
+    has_goal = np.isfinite(goal_time)
 
     frame = frame.with_columns([
-        pl.Series('_source_time', source_time), pl.Series('_window_id', stints),
-        pl.Series('_touching_ball_slot', touching_ball_slot),
-        pl.Series('_is_touching_ball', touching_ball_slot >= 0),
-        pl.Series('_next_touch_slot', next_touch_slot),
-        pl.Series('_next_touch_seconds', next_touch_seconds),
+        pl.Series('_source_time', source_time), pl.Series('stint_id', stints),
         pl.Series('time_until_next_goal', goal_time - source_time),
+        pl.Series('blue_goal_next', has_goal & (goal_team == 0)),
+        pl.Series('orange_goal_next', has_goal & (goal_team == 1)),
         pl.Series('_goal_row', goal_row),
-    ])
-    frame = frame.with_columns([
-        pl.Series('blue_goal_in_next_ten_seconds', blue_target),
-        pl.Series('orange_goal_in_next_ten_seconds', orange_target),
-        pl.Series('neither_goal_in_next_ten_seconds', ~(blue_target | orange_target)),
     ])
     pre_goal = np.r_[goal_row[1:], False]
     active = frame['frame_is_active'].cast(pl.Boolean, strict=False).fill_null(False).to_numpy()
@@ -578,11 +593,10 @@ def prepare_replay(
             rows = np.flatnonzero(kept_stints == stint)
             anchor_rows = rows[anchors[rows]]
 
-            if anchor_rows.size:
-                sample[np.arange(anchor_rows[-1], rows[0] - 1, -step)] = True
+            anchor = anchor_rows[-1] if anchor_rows.size else rows[-1]
+            sample[np.arange(anchor, rows[0] - 1, -step)] = True
 
         frame = frame.filter(pl.Series('_sample', sample))
-        frame = frame.filter(pl.col('stint_id').cast(pl.Int64).is_in(list(scoring_stints)))
         frame = frame.filter(
             (
                 pl.col('blue_team_score').cast(pl.Float32)
@@ -597,8 +611,8 @@ def prepare_replay(
     if random_augmentation:
         # All frames in a stint share one orientation so future-state labels
         # remain in the coordinate system of the evaluated frame.
-        choices = {int(stint): bool(np.random.random() < 0.5) for stint in np.unique(current_stints)}
-        augmentation = np.asarray([choices[int(stint)] for stint in current_stints], dtype=bool)
+        _, group = np.unique(current_stints, return_inverse=True)
+        augmentation = (np.random.random(group.max() + 1) < 0.5)[group]
     else:
         augmentation = np.zeros(frame.height, dtype=bool)
     updates = [
@@ -643,8 +657,10 @@ def prepare_replay(
         if name in frame.columns else pl.lit(False).alias(name)
         for name in EVENT_FLAG_COLUMNS
     )
-    columns = OUTPUT_COLUMNS + (tuple(f'player_{slot}_id' for slot in PLAYER_SLOTS)
-                                if include_player_ids else ())
+    columns = OUTPUT_COLUMNS
+    if include_player_camera:
+        columns += tuple(f'player_{slot}_{field}' for slot in PLAYER_SLOTS
+                         for field in PLAYER_CAMERA_FIELDS)
     if include_replay_date:
         columns += tuple(name for name in ('replay_datetime', 'replay_date')
                          if name in frame.columns)
@@ -715,10 +731,6 @@ class LGPSScaler:
         return cls._scale(values, cls.PLAYER_SCALE)
 
     @classmethod
-    def goal(cls, values):
-        return cls._scale(values, cls.GOAL_SCALE)
-
-    @classmethod
     def context(cls, values):
         return cls._scale(values, cls.CONTEXT_SCALE)
 
@@ -767,7 +779,7 @@ def player_slots(frame: pl.DataFrame, max_players_per_team: int) -> tuple[int | 
         + [None] * (max_players_per_team - len(teams[team]))
     )
 
-class EntityTokenizer:
+class LGPSEntityTokenizer:
     # Convert prepared replay rows into the configured separate entity streams.
 
     entity_types = torch.tensor([0, 1, 1, 1, 1, 1, 1, 2, 2] + [3] * 34, dtype=torch.long)
@@ -869,57 +881,107 @@ class EntityTokenizer:
             "entity_types": self.entity_types,
             "entity_teams": torch.from_numpy(entity_teams),
         }
-        if '_touching_ball_slot' in frame.columns:
-            result['touching_ball_slot'] = torch.from_numpy(
-                frame['_touching_ball_slot'].to_numpy().astype(np.int64)
-            )
-            result['is_touching_ball'] = torch.from_numpy(
-                frame['_is_touching_ball'].to_numpy().astype(bool)
-            )
         for name, count, columns, _ in BOOST_ENTITY_GROUPS:
             if name in self.model_entities:
                 result[name] = torch.from_numpy(frame.select(columns).to_numpy().astype(np.float32).reshape(frame.height, count, len(BOOST_FEATURES)))
         return result
 
-class LGPSAgents:
-    entity_types = EntityTokenizer.entity_types
-    entity_teams = EntityTokenizer.entity_teams
+class LGPSBatchBuilder:
+    entity_types = LGPSEntityTokenizer.entity_types
+    entity_teams = LGPSEntityTokenizer.entity_teams
 
-    def __init__(self, model_entities="all", *, targets_per_team=10, geometric_width=1.25,
-                 future_frames=(10, 30, 60, 100), sample_rate=TARGET_SAMPLE_RATE,
-                 aux_tasks=(LGPSBallStateAux, LGPSPlayerStateAux, LGPSNextTouchAux)):
+    def __init__(self, model_entities="all", *, targets_per_team=1, geometric_width=1.0,
+                 horizon_seconds=10.0, horizon_max=30.0,
+                 player_view=False, camera_config=None,
+                 two_way_prediction=False, drop_neither=False):
         self.model_entities = normalize_model_entities(model_entities)
-        self.tokenizer = EntityTokenizer(model_entities=self.model_entities)
+        self.tokenizer = LGPSEntityTokenizer(model_entities=self.model_entities)
         self.targets_per_team, self.geometric_width = targets_per_team, geometric_width
-        self.future_frames = tuple(() if future_frames is None else future_frames)
-        self.sample_rate = sample_rate
-        self.aux_tasks = tuple(() if aux_tasks is None else aux_tasks)
+        self.horizon_seconds = horizon_seconds
+        self.horizon_max = horizon_max
+        self.player_view = bool(player_view)
+        self.camera_config = {} if camera_config is None else dict(camera_config)
+        self.camera_config.setdefault('model_entities', self.model_entities)
+        self.two_way_prediction = bool(two_way_prediction)
+        self.drop_neither = bool(drop_neither)
 
-    def build(self, frame, indices=None, include_aux=True):
-        return build_frame_batch(frame, range(frame.height) if indices is None else indices,
+    def filter_indices(self, frame, indices):
+        if not self.two_way_prediction and not self.drop_neither:
+            return np.asarray(indices, dtype=np.int64)
+        indices = np.asarray(tuple(indices), dtype=np.int64)
+        times = frame['time_until_next_goal'].to_numpy()[indices].astype(np.float64, copy=False)
+        blue = frame['blue_goal_next'].to_numpy()[indices].astype(bool, copy=False)
+        orange = frame['orange_goal_next'].to_numpy()[indices].astype(bool, copy=False)
+        valid = np.ones(indices.size, dtype=bool)
+        if self.drop_neither:
+            valid &= np.isfinite(times)
+        if self.two_way_prediction:
+            valid &= np.isfinite(times) & (times > 0.0) & (blue | orange)
+            if not (self.horizon_seconds is None or self.horizon_seconds == 0):
+                valid &= times <= self.horizon_seconds
+        return indices[valid]
+
+    def filter_frame(self, frame):
+        # Filter target rows before replay samples are packed into minibatches.
+        if not self.two_way_prediction and not self.drop_neither:
+            return frame
+        indices = self.filter_indices(frame, range(frame.height))
+        if indices.size == frame.height:
+            return frame
+        return frame[indices.tolist()]
+
+    def build(self, frame, indices=None):
+        indices = range(frame.height) if indices is None else indices
+        indices = self.filter_indices(frame, indices)
+        if not indices.size:
+            return None
+        result = build_frame_batch(frame, indices,
                              self.tokenizer,
                              targets_per_team=self.targets_per_team,
                              geometric_width=self.geometric_width,
-                             future_frames=self.future_frames,
-                             sample_rate=self.sample_rate,
-                             include_aux=include_aux, aux_tasks=self.aux_tasks,
-                             )
+                             horizon_seconds=self.horizon_seconds,
+                             horizon_max=self.horizon_max,
+                             two_way_prediction=self.two_way_prediction)
+        if self.player_view and result is not None:
+            result.update(camera_histories(frame, indices, **self.camera_config))
+        return result
 
-class LGPSDataSource:
-    def __init__(self, path, model_entities="all", aux_tasks=(), sample_rate=TARGET_SAMPLE_RATE):
+class LGPSReplaySource:
+    def __init__(self, path, model_entities="all", sample_rate=TARGET_SAMPLE_RATE,
+                 player_view=False, train_split=0.9, val_split=0.0):
         self.model_entities = normalize_model_entities(model_entities)
-        self.aux_tasks = tuple(() if aux_tasks is None else aux_tasks)
+        self.player_view = bool(player_view)
         path = Path(path)
         self._prepared_input = None
-        if source_is_raw(path):
-            self._prepared_input = tempfile.TemporaryDirectory(prefix='lgps-prepared-')
-            try:
-                prepare_dataset(path, self._prepared_input.name,
-                                target_sample_rate=sample_rate)
-            except BaseException:
-                self._prepared_input.cleanup()
-                raise
-            path = Path(self._prepared_input.name)
+        if (not math.isfinite(train_split) or not math.isfinite(val_split)
+                or train_split < 0 or val_split < 0 or train_split + val_split > 1):
+            raise ValueError('train_split and val_split must be non-negative and sum to at most one')
+        is_raw = source_is_raw(path)
+        if is_raw:
+            self.is_raw = True
+            self.raw_path = path
+            self.raw_paths = tuple(sorted(
+                candidate for candidate in (path.rglob('*') if path.is_dir() else (path,))
+                if candidate.is_file() and candidate.suffix.lower() in ('.parquet', '.tar')
+            ))
+            if not self.raw_paths:
+                raise FileNotFoundError(f'No replay Parquet files or archives under: {path}')
+            self.sample_rate = sample_rate
+            self.train_split = float(train_split)
+            self.val_split = float(val_split)
+            # Raw replay inputs may be read-only. Keep prepared replay caches
+            # in temp storage, keyed by the input path so separate sources do
+            # not collide.
+            cache_root = Path(os.environ.get('LGPS_CACHE_DIR', Path(tempfile.gettempdir()) / 'lgps_cache'))
+            cache_key = hashlib.blake2b(str(path.resolve()).encode('utf-8'), digest_size=12).hexdigest()
+            self.cache_dir = cache_root / cache_key
+            self.paths = self.raw_paths
+            self.read_columns = {}
+            self.row_groups = {}
+            self.row_counts = {}
+            self.total_rows = None
+            return
+        self.is_raw = False
         if path.is_file():
             candidate_paths = (
                 (path,)
@@ -949,6 +1011,40 @@ class LGPSDataSource:
         }
         self.total_rows = sum(self.row_counts.values())
 
+
+    def prepared_cache_path(self, source_path, source_name, replay_id):
+        # Invalidate cached frames when the source or preparation settings change.
+        source_path = Path(source_path)
+        stat = source_path.stat()
+        identity = '\0'.join((
+            str(source_path.resolve()), str(stat.st_size), str(stat.st_mtime_ns),
+            str(source_name), str(replay_id), str(self.sample_rate),
+            str(int(self.player_view)), str(PREPARED_CACHE_VERSION),
+        ))
+        key = hashlib.blake2b(identity.encode('utf-8'), digest_size=20).hexdigest()
+        return self.cache_dir / f'{key}.cache'
+
+    def replay_manifest_path(self, source_path):
+        source_path = Path(source_path)
+        stat = source_path.stat()
+        identity = '\0'.join((str(source_path.resolve()), str(stat.st_size),
+                              str(stat.st_mtime_ns), str(PREPARED_CACHE_VERSION),
+                              str(self.sample_rate), str(int(self.player_view))))
+        key = hashlib.blake2b(identity.encode('utf-8'), digest_size=20).hexdigest()
+        return self.cache_dir / f'{key}.manifest'
+
+    def split_for_replay(self, source_name, replay_id):
+        source_parts = str(source_name).replace('\\', '/').lower().split('/')
+        if '2026' in source_parts:
+            return 'test'
+        digest = hashlib.blake2b(str(replay_id).encode('utf-8'), digest_size=8).digest()
+        value = int.from_bytes(digest, 'big') / float(1 << 64)
+        if value < self.train_split:
+            return 'train'
+        if value < self.train_split + self.val_split:
+            return 'validation'
+        return 'test'
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state['_prepared_input'] = None
@@ -957,14 +1053,18 @@ class LGPSDataSource:
     @staticmethod
     def row_groups_for_path(path):
         # Return row-group starts and lengths without scanning Parquet data.
-        metadata = pq.ParquetFile(path).metadata
-        start = 0
-        groups = []
-        for index in range(metadata.num_row_groups):
-            length = metadata.row_group(index).num_rows
-            groups.append((start, length))
-            start += length
-        return tuple(groups)
+        reader = pq.ParquetFile(path)
+        try:
+            metadata = reader.metadata
+            start = 0
+            groups = []
+            for index in range(metadata.num_row_groups):
+                length = metadata.row_group(index).num_rows
+                groups.append((start, length))
+                start += length
+            return tuple(groups)
+        finally:
+            reader.close()
 
     def columns_for_path(self, path):
         schema = set(pl.read_parquet_schema(path))
@@ -979,7 +1079,7 @@ class LGPSDataSource:
         slots = tuple(int(column.split("_")[1]) for column in team_columns)
         player_columns = player_feature_columns(slots)
         required = {
-            "replay_id", "time_until_next_goal", *GOAL_STATE_COLUMNS,
+            "replay_id", "stint_id", "time_until_next_goal", *GOAL_LABEL_COLUMNS,
             *(BIG_BOOST_COLUMNS if "big_boosts" in self.model_entities else ()),
             *(SMALL_BOOST_COLUMNS if "small_boosts" in self.model_entities else ()),
             *CONTEXT_FEATURES,
@@ -987,10 +1087,10 @@ class LGPSDataSource:
             *team_columns,
             *player_columns,
         }
-        if any(task in self.aux_tasks for task in (LGPSBallStateAux, LGPSPlayerStateAux)):
-            required.update(("_window_id", "_source_time"))
-        if LGPSNextTouchAux in self.aux_tasks:
-            required.update(("_next_touch_slot", "_next_touch_seconds"))
+        if self.player_view:
+            required.update(("_source_time", *BIG_BOOST_COLUMNS, *SMALL_BOOST_COLUMNS,
+                             *(f"player_{slot}_{field}" for slot in PLAYER_SLOTS
+                               for field in PLAYER_CAMERA_FIELDS)))
         goal_columns = tuple(column for column in GOAL_COLUMNS if column in schema)
         missing = required.difference(schema)
         if missing:
@@ -998,15 +1098,17 @@ class LGPSDataSource:
                 f"{path}: missing model-ready columns: {sorted(missing)}; rerun LGPS prepare_dataset"
             )
         optional = tuple(column for column in (
-            "_source_time", "_window_id",
-            "_touching_ball_slot", "_is_touching_ball", "_next_touch_slot", "_next_touch_seconds",
+            "_source_time",
+            *(f"player_{slot}_id" for slot in PLAYER_SLOTS),
+            *(f"player_{slot}_{field}" for slot in PLAYER_SLOTS
+              for field in PLAYER_CAMERA_FIELDS),
         ) if column in schema)
         return tuple(dict.fromkeys(
             (
-            "replay_id", *optional, "time_until_next_goal", *GOAL_STATE_COLUMNS,
+            "replay_id", "stint_id", *optional, "time_until_next_goal", *GOAL_LABEL_COLUMNS,
                 *goal_columns,
-                *(BIG_BOOST_COLUMNS if "big_boosts" in self.model_entities else ()),
-                *(SMALL_BOOST_COLUMNS if "small_boosts" in self.model_entities else ()),
+                *(BIG_BOOST_COLUMNS if "big_boosts" in self.model_entities or self.player_view else ()),
+                *(SMALL_BOOST_COLUMNS if "small_boosts" in self.model_entities or self.player_view else ()),
                     *CONTEXT_FEATURES,
                 *BALL_FEATURES,
                 *team_columns,
@@ -1014,26 +1116,48 @@ class LGPSDataSource:
             )
         ))
 
+    def _read_chunks(self, path, start, end, chunk_rows):
+        # Read ordinary replay-sized row groups in one call. Stream only large
+        # groups so a single group cannot dominate each worker's live memory.
+        groups = [index for index, (group_start, group_rows) in enumerate(self.row_groups[path])
+                  if group_start < end and group_start + group_rows > start]
+        if not groups:
+            return
+        reader = pq.ParquetFile(path)
+        try:
+            columns = list(self.read_columns[path])
+            for group_index in groups:
+                group_start, group_rows = self.row_groups[path][group_index]
+                if group_rows <= chunk_rows:
+                    table = reader.read_row_group(group_index, columns=columns)
+                    first = max(start - group_start, 0)
+                    last = min(end - group_start, group_rows)
+                    yield pl.from_arrow(table.slice(first, last - first))
+                    continue
+                cursor = group_start
+                for batch in reader.iter_batches(
+                    batch_size=chunk_rows, row_groups=[group_index], columns=columns,
+                ):
+                    batch_start = cursor
+                    cursor += batch.num_rows
+                    first = max(start - batch_start, 0)
+                    last = min(end - batch_start, batch.num_rows)
+                    if last > first:
+                        yield pl.from_arrow(batch.slice(first, last - first))
+        finally:
+            reader.close()
+
     def read_batches(self, path, batch_size=2048, offset=0, length=None, lookahead=0):
-        # Yield a contiguous range by reading only intersecting row groups.
+        # Yield a contiguous range without materializing whole Parquet row groups.
         end = self.row_counts[path] if length is None else min(
             self.row_counts[path], offset + length
         )
         if offset < 0 or end < offset:
             raise ValueError("invalid parquet row range")
-        reader = pq.ParquetFile(path)
         pending = None
-        for group_index, (group_start, group_rows) in enumerate(self.row_groups[path]):
-            group_end = group_start + group_rows
-            if group_end <= offset or group_start >= end:
-                continue
-            table = reader.read_row_group(
-                group_index,
-                columns=list(self.read_columns[path]),
-            )
-            first = max(offset - group_start, 0)
-            last = min(end - group_start, group_rows)
-            current = pl.from_arrow(table.slice(first, last - first))
+        for current in self._read_chunks(
+            path, offset, end, max(batch_size * 16, batch_size + lookahead)
+        ):
             pending = current if pending is None else pl.concat([pending, current])
             while pending.height >= batch_size + lookahead:
                 yield pending.slice(0, batch_size + lookahead), batch_size
@@ -1043,7 +1167,36 @@ class LGPSDataSource:
             yield pending.slice(0, count + lookahead), count
             pending = pending.slice(count)
 
-class LGPSDataset(IterableDataset):
+    def read_camera_batches(self, path, batch_size, offset, length, lookahead, lookbehind,
+                            history_floor=0):
+        # Reuse per-frame observations across overlapping windows in one batch.
+        end = min(self.row_counts[path], offset + length)
+        read_start = max(history_floor, offset - lookbehind)
+        pending = None
+        pending_start = read_start
+        target_start = offset
+        for current in self._read_chunks(
+            path, read_start, end,
+            max(batch_size * 16, batch_size + lookahead + lookbehind),
+        ):
+            pending = current if pending is None else pl.concat((pending, current))
+            while target_start + batch_size + lookahead <= pending_start + pending.height:
+                context_start = max(pending_start, target_start - lookbehind)
+                prefix = target_start - context_start
+                yield pending.slice(context_start - pending_start, prefix + batch_size + lookahead), batch_size, prefix
+                target_start += batch_size
+                discard = max(pending_start, target_start - lookbehind)
+                pending = pending.slice(discard - pending_start)
+                pending_start = discard
+        while target_start < end:
+            count = min(batch_size, end - target_start)
+            context_start = max(pending_start, target_start - lookbehind)
+            prefix = target_start - context_start
+            yield pending.slice(context_start - pending_start, prefix + count + lookahead), count, prefix
+            target_start += count
+
+
+class LGPSPreparedBatchDataset(IterableDataset):
     def __init__(
         self,
         source,
@@ -1055,7 +1208,6 @@ class LGPSDataset(IterableDataset):
         split_end=None,
         drop_last=False,
         lookahead=0,
-        include_aux=True,
     ):
         super().__init__()
         self.drop_last = drop_last
@@ -1067,7 +1219,6 @@ class LGPSDataset(IterableDataset):
         self.split_start = split_start
         self.split_end = source.total_rows if split_end is None else split_end
         self.lookahead = lookahead
-        self.include_aux = include_aux
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -1092,73 +1243,263 @@ class LGPSDataset(IterableDataset):
                 continue
             local_start = max(shard_start - path_start, 0)
             local_end = min(shard_end - path_start, path_rows)
-            for frame in self.source.read_batches(
-                path, batch_size=self.batch_size, offset=local_start,
-                length=local_end - local_start,
-                lookahead=self.lookahead,
-            ):
-                frame, count = frame
+            if self.builder.player_view:
+                lookbehind = int(math.ceil(self.builder.camera_config['history_seconds']
+                                           * self.builder.sample_rate)) + 2
+                floor = max(self.split_start - path_start, 0)
+                batches = self.source.read_camera_batches(
+                    path, self.batch_size, local_start, local_end - local_start,
+                    self.lookahead, lookbehind, history_floor=floor,
+                )
+            else:
+                batches = self.source.read_batches(
+                    path, batch_size=self.batch_size, offset=local_start,
+                    length=local_end - local_start, lookahead=self.lookahead,
+                )
+            for batch in batches:
+                frame, count, prefix = batch if self.builder.player_view else (*batch, 0)
                 if self.drop_last and count != self.batch_size:
                     break
-                yield self.builder.build(frame, range(count), include_aux=self.include_aux)
+                prepared = self.builder.build(frame, range(prefix, prefix + count))
+                if prepared is not None:
+                    yield prepared
 
 
+class LGPSRawReplayBatchDataset(IterableDataset):
+    def __init__(self, source, builder, batch_size, *, split, rank=0, world_size=1,
+                 drop_last=False):
+        super().__init__()
+        self.source = source
+        self.builder = builder
+        self.batch_size = batch_size
+        self.split = split
+        self.rank = rank
+        self.world_size = world_size
+        self.drop_last = drop_last
 
-class SerializedDataset(IterableDataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
+    @staticmethod
+    def combine_batches(batches):
+        # Join replay fragments into the same full microbatches as prepared inputs.
+        return {
+            key: batches[0][key] if key == 'entity_types'
+            else torch.cat([batch[key] for batch in batches], dim=0)
+            for key in batches[0]
+        }
+
+    def build_batch(self, frame, start, end):
+        batch = self.builder.build(frame, range(start, end))
+        if any(value.device.type != 'cpu' for value in batch.values()
+               if isinstance(value, torch.Tensor)):
+            raise RuntimeError('LGPS replay preparation must run on CPU')
+        return batch
 
     def __iter__(self):
-        return iter(self.dataset)
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        worker_count = worker_info.num_workers if worker_info is not None else 1
+        shard_rank = self.rank * worker_count + worker_id
+        shard_count = self.world_size * worker_count
+        paths = [path for index, path in enumerate(self.source.raw_paths)
+                 if index % shard_count == shard_rank]
+        pending_batches = []
+        pending_rows = 0
 
-    def __reduce__(self):
-        return cloudpickle.loads, (cloudpickle.dumps(self.dataset),)
+        def emit_prepared(prepared, is_training):
+            nonlocal pending_batches, pending_rows
+            prepared = self.builder.filter_frame(prepared)
+            if is_training and not prepared.is_empty():
+                prepared = randomize_prepared_replay(prepared)
+            start = 0
+            if pending_rows and prepared.height:
+                count = min(self.batch_size - pending_rows, prepared.height)
+                pending_batches.append(self.build_batch(prepared, 0, count))
+                pending_rows += count
+                start = count
+                if pending_rows == self.batch_size:
+                    yield self.combine_batches(pending_batches)
+                    pending_batches = []
+                    pending_rows = 0
+            while start + self.batch_size <= prepared.height:
+                yield self.build_batch(prepared, start, start + self.batch_size)
+                start += self.batch_size
+            if start < prepared.height:
+                pending_batches.append(self.build_batch(prepared, start, prepared.height))
+                pending_rows += prepared.height - start
+
+        if self.split == 'train':
+            seed = worker_info.seed if worker_info is not None else torch.initial_seed()
+            np.random.default_rng(seed).shuffle(paths)
+        for path in paths:
+            manifest_path = self.source.replay_manifest_path(path)
+            manifest = None
+            if manifest_path.exists():
+                try:
+                    entries = json.loads(manifest_path.read_text(encoding='utf-8'))
+                    if all((self.source.cache_dir / entry['cache']).is_file() for entry in entries):
+                        manifest = entries
+                except (OSError, ValueError, KeyError, TypeError):
+                    manifest = None
+
+            if manifest is not None:
+                for entry in manifest:
+                    replay_split = self.source.split_for_replay(entry['source'], entry['replay_id'])
+                    if self.split != 'all' and replay_split != self.split:
+                        continue
+                    prepared = pl.read_parquet(self.source.cache_dir / entry['cache'])
+                    yield from emit_prepared(prepared, self.split == 'train' and replay_split == 'train')
+                continue
+
+            entries = []
+            for source_name, parquet in iter_parquets(path):
+                columns = selected_source_columns(
+                    set(parquet.schema_arrow.names), include_player_camera=self.source.player_view,
+                )
+                for replay in iter_replays(parquet, columns):
+                    replay_id = str(replay['replay_id'][0])
+                    cache_path = self.source.prepared_cache_path(path, source_name, replay_id)
+                    if cache_path.exists():
+                        prepared = pl.read_parquet(cache_path)
+                    else:
+                        prepared = prepare_replay(
+                            replay,
+                            random_augmentation=False,
+                            target_sample_rate=self.source.sample_rate,
+                            include_player_camera=self.source.player_view,
+                        )
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        temporary_path = cache_path.with_name(
+                            f'{cache_path.name}.{os.getpid()}.{worker_id}.tmp'
+                        )
+                        pq.write_table(prepared.to_arrow(), temporary_path,
+                                       compression='zstd', use_dictionary=False)
+                        try:
+                            os.replace(temporary_path, cache_path)
+                        except OSError:
+                            if not cache_path.exists():
+                                raise
+                            temporary_path.unlink(missing_ok=True)
+                    entries.append({'source': source_name, 'replay_id': replay_id,
+                                    'cache': cache_path.name})
+                    replay_split = self.source.split_for_replay(source_name, replay_id)
+                    if self.split == 'all' or replay_split == self.split:
+                        yield from emit_prepared(
+                            prepared, self.split == 'train' and replay_split == 'train'
+                        )
+
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_manifest = manifest_path.with_name(
+                f'{manifest_path.name}.{os.getpid()}.{worker_id}.tmp'
+            )
+            temporary_manifest.write_text(json.dumps(entries), encoding='utf-8')
+            os.replace(temporary_manifest, manifest_path)
+
+        if pending_rows and not self.drop_last:
+            yield self.combine_batches(pending_batches)
 
 
-class LGPSData:
+
+class LGPSDataset:
     # Data pipeline assembled from training, model, and runtime contracts.
     def __init__(self, train_config, model_config, runtime_config, rank=0, world_size=1):
-        if not {'ball', 'players'}.issubset(model_config.model_entities):
-            raise ValueError('LGPS auxiliary training requires ball and player entities')
+        train_config = normalize_lgps_train_config(train_config)
         self.train_config = train_config
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.rank = rank
         self.world_size = world_size
-        self.source = LGPSDataSource(train_config.input_path, model_config.model_entities,
-                                     train_config.aux_tasks, model_config.sample_rate)
-        self.builder = LGPSAgents(
+        self.source = LGPSReplaySource(train_config.input_path, model_config.model_entities,
+                                     model_config.sample_rate,
+                                     train_config.player_view is not None,
+                                     train_config.train_split, train_config.val_split)
+        self.test_source = (
+            LGPSReplaySource(train_config.test_path, model_config.model_entities,
+                           model_config.sample_rate,
+                           train_config.player_view is not None)
+            if train_config.test_path is not None else None
+        )
+        self.builder = LGPSBatchBuilder(
             model_config.model_entities,
             targets_per_team=model_config.targets_per_team,
             geometric_width=model_config.geometric_width,
-            future_frames=train_config.future_frames,
-            sample_rate=model_config.sample_rate,
-            aux_tasks=train_config.aux_tasks,
+            horizon_seconds=model_config.horizon_seconds,
+            horizon_max=model_config.horizon_max,
+            player_view=train_config.player_view is not None,
+            camera_config={
+                'history_seconds': train_config.player_view.history_seconds,
+                'sample_rate': train_config.player_view.sample_rate,
+                'mode': train_config.player_view.camera_mode,
+                'fov_degrees': train_config.player_view.fov_degrees,
+                'distance': train_config.player_view.distance,
+                'height': train_config.player_view.height,
+                'angle_degrees': train_config.player_view.angle_degrees,
+                'aspect_ratio': train_config.player_view.aspect_ratio,
+            } if train_config.player_view is not None else None,
+            two_way_prediction=model_config.two_way_prediction,
+            drop_neither=train_config.drop_neither,
         )
 
-        replays = (pl.concat([pl.scan_parquet(path).select('replay_id')
-                              for path in self.source.paths])
-                   .with_row_index('_row')
-                   .filter(pl.col('replay_id').ne(pl.col('replay_id').shift()).fill_null(True))
-                   .collect(engine='streaming'))
-        if replays['replay_id'].null_count() or replays['replay_id'].n_unique() != replays.height:
-            raise ValueError('replay_id must be non-null and contiguous')
-        boundaries = (*replays['_row'].to_list(), self.source.total_rows)
-        replay_count = len(boundaries) - 1
-        train_count = min(replay_count, int(math.floor(replay_count * train_config.train_split + 0.5)))
-        validation_count = min(replay_count, int(math.floor(
-            replay_count * (train_config.train_split + train_config.val_split) + 0.5
-        )))
-        train_end = boundaries[train_count]
-        validation_end = boundaries[validation_count]
-        self.ranges = {
-            "train": (0, train_end),
-            "validation": (train_end, validation_end),
-            "test": (validation_end, self.source.total_rows),
-        }
+        if self.source.is_raw:
+            self.ranges = None
+        else:
+            distributed = self.world_size > 1 and dist.is_available() and dist.is_initialized()
+            if not distributed or self.rank == 0:
+                replays = (pl.concat([pl.scan_parquet(path).select('replay_id')
+                                      for path in self.source.paths])
+                           .with_row_index('_row')
+                           .filter(pl.col('replay_id').ne(pl.col('replay_id').shift()).fill_null(True))
+                           .collect(engine='streaming'))
+                if replays['replay_id'].null_count() or replays['replay_id'].n_unique() != replays.height:
+                    raise ValueError('replay_id must be non-null and contiguous')
+                boundaries = (*replays['_row'].to_list(), self.source.total_rows)
+                replay_count = len(boundaries) - 1
+                train_count = min(replay_count, int(math.floor(replay_count * train_config.train_split + 0.5)))
+                validation_count = min(replay_count, int(math.floor(
+                    replay_count * (train_config.train_split + train_config.val_split) + 0.5
+                )))
+                cuts = (boundaries[train_count], boundaries[validation_count])
+            else:
+                cuts = (0, 0)
+            if distributed:
+                device = torch.device('cuda', torch.cuda.current_device()) if dist.get_backend() == 'nccl' else torch.device('cpu')
+                shared_cuts = torch.tensor(cuts, dtype=torch.int64, device=device)
+                dist.broadcast(shared_cuts, src=0)
+                cuts = tuple(int(value) for value in shared_cuts.tolist())
+            train_end, validation_end = cuts
+            self.ranges = {
+                "train": (0, train_end),
+                "validation": (train_end, validation_end),
+                "test": ((0, self.test_source.total_rows) if self.test_source is not None
+                         else (validation_end, self.source.total_rows)),
+            }
 
     def loader(self, batch_size, split):
-        split_start, split_end = self.ranges[split]
+        source = self.test_source if split == 'test' and self.test_source is not None else self.source
+        if source.is_raw:
+            raw_split = 'all' if source is not self.source else split
+            num_workers = self.runtime_config.data_workers
+            if num_workers < 0:
+                raise ValueError("data_workers must be non-negative")
+            kwargs = {
+                "batch_size": None,
+                "num_workers": num_workers,
+                "pin_memory": self.runtime_config.pin_memory and torch.cuda.is_available(),
+            }
+            if num_workers > 0:
+                kwargs.update(
+                    multiprocessing_context="spawn",
+                    persistent_workers=self.runtime_config.persistent_workers,
+                    prefetch_factor=self.runtime_config.prefetch_factor,
+                )
+            dataset = LGPSRawReplayBatchDataset(
+                source, self.builder, batch_size, split=raw_split,
+                rank=self.rank, world_size=self.world_size,
+                drop_last=(split == 'train' and self.runtime_config.drop_last),
+            )
+            return DataLoader(dataset, **kwargs)
+        if self.source.is_raw:
+            split_start, split_end = 0, source.total_rows
+        else:
+            split_start, split_end = self.ranges[split]
         if split_start >= split_end:
             return None
 
@@ -1176,8 +1517,8 @@ class LGPSData:
                 persistent_workers=self.runtime_config.persistent_workers,
                 prefetch_factor=self.runtime_config.prefetch_factor,
             )
-        dataset = LGPSDataset(
-            self.source,
+        dataset = LGPSPreparedBatchDataset(
+            source,
             self.builder,
             batch_size,
             rank=self.rank,
@@ -1185,14 +1526,9 @@ class LGPSData:
             split_start=split_start,
             split_end=split_end,
             drop_last=(split == "train" and self.runtime_config.drop_last),
-            lookahead=(max(self.train_config.future_frames or ())
-                       if split == 'train' and self.train_config.future_frames
-                       and any(task in self.train_config.aux_tasks
-                               for task in (LGPSBallStateAux, LGPSPlayerStateAux)) else 0),
-            include_aux=(split == 'train' and bool(self.train_config.aux_tasks)),
         )
         return DataLoader(
-            SerializedDataset(dataset) if num_workers else dataset,
+            dataset,
             **kwargs,
         )
 
@@ -1207,31 +1543,163 @@ class LGPSData:
         batch_size = self.runtime_config.per_gpu_batch_size or self.train_config.batch_size
         return self.loader(min(self.train_config.validation_batch_size, batch_size), "test")
 
+def _source_parquet_specs(source):
+    source = Path(source)
+    paths = ((source,) if source.is_file() else tuple(sorted(
+        path for path in source.rglob('*')
+        if path.is_file() and path.suffix.lower() in ('.parquet', '.tar')
+    )))
+    specs = []
+    for path in paths:
+        if path.suffix.lower() == '.parquet':
+            specs.append((str(path), None))
+        elif path.suffix.lower() == '.tar':
+            with tarfile.open(path, 'r:') as archive:
+                specs.extend((str(path), member.name) for member in archive
+                             if member.isfile() and member.name.endswith('_frames.parquet'))
+    return specs
 
-def prepare_dataset(source, output_dir, *, max_replays=None, target_sample_rate=TARGET_SAMPLE_RATE):
+
+def _source_parquet(source_path, member_name=None):
+    if member_name is None:
+        return pq.ParquetFile(source_path), None
+    archive = tarfile.open(source_path, 'r:')
+    stream = archive.extractfile(member_name)
+    if stream is None:
+        archive.close()
+        raise FileNotFoundError(f'{member_name} is missing from {source_path}')
+    return pq.ParquetFile(stream), archive
+
+
+def _date_year(value):
+    import datetime
+    import re
+
+    if value is None:
+        return None
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.year
+    match = re.match(r'^(20\d{2})', str(value))
+    return int(match.group(1)) if match else None
+
+
+def _prepare_source_shard(task):
+    (index, source_specs, staging_dir, rate, camera,
+     test_replay_ids, test_year) = task
+    source_writers = {}
+    source_buffers = {'train': [], 'test': []}
+    source_buffered_rows = {'train': 0, 'test': 0}
+    shard_paths = {}
+    replay_info = []
+
+    def flush_source(split):
+        if not source_buffers[split]:
+            return
+        table = pa.concat_tables(source_buffers[split])
+        if split not in source_writers:
+            shard_path = str(Path(staging_dir) / f'{index:08d}-{split}.parquet')
+            shard_paths[split] = shard_path
+            float_columns = [field.name for field in table.schema
+                             if pa.types.is_floating(field.type)]
+            source_writers[split] = pq.ParquetWriter(
+                shard_path, table.schema,
+                compression='zstd', use_dictionary=['replay_id'],
+                use_byte_stream_split=float_columns,
+            )
+        source_writers[split].write_table(table, row_group_size=WRITE_BATCH_ROWS)
+        source_buffers[split].clear()
+        source_buffered_rows[split] = 0
+
+    try:
+        for source_path, member_name in source_specs:
+            parquet, archive = _source_parquet(source_path, member_name)
+            try:
+                columns = selected_source_columns(
+                    set(parquet.schema_arrow.names), include_player_camera=camera,
+                )
+                for replay in iter_replays(parquet, columns):
+                    replay_id = replay['replay_id'][0]
+                    date_col = next((name for name in ('replay_datetime', 'replay_date')
+                                     if name in replay.columns), None)
+                    year = _date_year(replay[date_col][0]) if date_col is not None else None
+                    replay_info.append((replay_id, year))
+                    if test_year is not None:
+                        if year is None:
+                            raise ValueError(f'replay {replay_id} has no parseable date for test_year split')
+                        split = 'test' if year == test_year else 'train'
+                    else:
+                        split = 'test' if test_replay_ids is not None and replay_id in test_replay_ids else 'train'
+                    prepared = prepare_replay(
+                        replay, random_augmentation=True,
+                        target_sample_rate=rate,
+                        include_player_camera=camera,
+                    )
+                    if prepared.is_empty():
+                        continue
+                    table = prepared.to_arrow()
+                    source_buffers[split].append(table)
+                    source_buffered_rows[split] += table.num_rows
+                    if source_buffered_rows[split] >= WRITE_BATCH_ROWS:
+                        flush_source(split)
+            finally:
+                if archive is not None:
+                    archive.close()
+        for split in source_buffers:
+            flush_source(split)
+    finally:
+        for writer in source_writers.values():
+            writer.close()
+    return index, shard_paths, replay_info
+
+
+def prepare_dataset(source, output_dir, *, max_replays=None, target_sample_rate=TARGET_SAMPLE_RATE,
+                    include_player_camera=False, test_replay_ids=None,
+                    workers=1, staging_dir=None, test_year=None):
     # Accept a Parquet file, tar archive, or nested source directory.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     writers = {}
     seen_replays = set()
+    test_replay_ids = None if test_replay_ids is None else set(test_replay_ids)
+    workers = max(1, int(workers))
+    if test_year is not None and test_replay_ids is not None:
+        raise ValueError('specify either test_year or test_replay_ids, not both')
+    if workers > 1 and max_replays is None:
+        return _prepare_dataset_parallel(
+            source, output_dir, target_sample_rate=target_sample_rate,
+            include_player_camera=include_player_camera,
+            test_replay_ids=test_replay_ids, test_year=test_year,
+            workers=workers, staging_dir=staging_dir,
+        )
     try:
-        for source_name, parquet in iter_parquets(Path(source)):
-            split = split_for_source(source_name)
-            columns = selected_source_columns(set(parquet.schema_arrow.names))
+        for _, parquet in iter_parquets(Path(source)):
+            columns = selected_source_columns(set(parquet.schema_arrow.names),
+                                              include_player_camera=include_player_camera)
             for replay in iter_replays(parquet, columns):
                 replay_id = replay['replay_id'][0]
                 if replay_id in seen_replays:
                     raise ValueError(f'duplicate replay_id across source files: {replay_id}')
                 seen_replays.add(replay_id)
-                prepared = prepare_replay(replay, random_augmentation=(split == 'train'),
-                                          target_sample_rate=target_sample_rate)
+                if test_year is not None:
+                    date_col = next((name for name in ('replay_datetime', 'replay_date')
+                                     if name in replay.columns), None)
+                    replay_year = _date_year(replay[date_col][0]) if date_col is not None else None
+                    if replay_year is None:
+                        raise ValueError(f'replay {replay_id} has no parseable replay date for test_year split')
+                    split = 'test' if replay_year == test_year else 'train'
+                else:
+                    split = 'test' if test_replay_ids is not None and replay_id in test_replay_ids else 'train'
+                prepared = prepare_replay(replay, random_augmentation=True,
+                                          target_sample_rate=target_sample_rate,
+                                          include_player_camera=include_player_camera)
                 if not prepared.is_empty():
+                    table = prepared.rechunk().to_arrow()
                     if split not in writers:
                         writers[split] = pq.ParquetWriter(
-                            output_dir / f'{split}.parquet', prepared.to_arrow().schema,
+                            output_dir / f'{split}.parquet', table.schema,
                             compression='zstd', use_dictionary=False,
                         )
-                    writers[split].write_table(prepared.rechunk().to_arrow(), row_group_size=WRITE_BATCH_ROWS)
+                    writers[split].write_table(table, row_group_size=WRITE_BATCH_ROWS)
                 if max_replays is not None and len(seen_replays) >= max_replays:
                     break
             if max_replays is not None and len(seen_replays) >= max_replays:
@@ -1239,6 +1707,104 @@ def prepare_dataset(source, output_dir, *, max_replays=None, target_sample_rate=
     finally:
         for writer in writers.values():
             writer.close()
+    return {split: output_dir / f'{split}.parquet' for split in writers}
+
+
+def _prepare_dataset_parallel(source, output_dir, *, target_sample_rate,
+                              include_player_camera,
+                              test_replay_ids, test_year, workers, staging_dir):
+    from joblib import Parallel, delayed
+
+    specs = _source_parquet_specs(source)
+    if not specs:
+        raise FileNotFoundError(f'No replay Parquet files or archives under: {source}')
+
+    stage_root = Path(staging_dir) if staging_dir is not None else output_dir
+    stage_root.mkdir(parents=True, exist_ok=True)
+    counts = {'train': 0, 'test': 0}
+    seen_replays = set()
+    writers = {}
+    table_buffers = {'train': [], 'test': []}
+    buffered_rows = {'train': 0, 'test': 0}
+
+    def flush_tables(split):
+        if not table_buffers[split]:
+            return
+        table = pa.concat_tables(table_buffers[split])
+        if split not in writers:
+            float_columns = [field.name for field in table.schema
+                             if pa.types.is_floating(field.type)]
+            writers[split] = pq.ParquetWriter(
+                output_dir / f'{split}.parquet', table.schema,
+                compression='zstd', use_dictionary=['replay_id'],
+                use_byte_stream_split=float_columns,
+            )
+        writers[split].write_table(table, row_group_size=WRITE_BATCH_ROWS)
+        table_buffers[split].clear()
+        buffered_rows[split] = 0
+
+    with tempfile.TemporaryDirectory(prefix='lgps-parallel-', dir=stage_root) as temporary:
+        sources_per_task = max(1, min(512, workers * 128))
+        source_batches = (
+            specs[offset:offset + sources_per_task]
+            for offset in range(0, len(specs), sources_per_task)
+        )
+        tasks = (
+            (index, source_batch, temporary, target_sample_rate,
+             include_player_camera, test_replay_ids, test_year)
+            for index, source_batch in enumerate(source_batches)
+        )
+        pending = {}
+        next_index = 0
+        build_started = time.perf_counter()
+        reported_replays = 0
+        results = Parallel(
+            n_jobs=workers, backend='loky', batch_size=1,
+            return_as='generator_unordered', pre_dispatch=workers,
+            backend_kwargs={'inner_max_num_threads': 1},
+        )(delayed(_prepare_source_shard)(task) for task in tasks)
+        try:
+            for index, shard_paths, replay_info in results:
+                pending[index] = (shard_paths, replay_info)
+                while next_index in pending:
+                    shard_paths, replay_info = pending.pop(next_index)
+                    for replay_id, year in replay_info:
+                        if replay_id in seen_replays:
+                            raise ValueError(f'duplicate replay_id across source files: {replay_id}')
+                        seen_replays.add(replay_id)
+                        if test_year is not None and year is None:
+                            raise ValueError(f'replay {replay_id} has no parseable date for test_year split')
+                        split = ('test' if year == test_year else 'train') if test_year is not None else (
+                            'test' if test_replay_ids is not None and replay_id in test_replay_ids else 'train'
+                        )
+                        counts[split] += 1
+                    for split, shard in shard_paths.items():
+                        try:
+                            table = pq.read_table(shard)
+                            table_buffers[split].append(table)
+                            buffered_rows[split] += table.num_rows
+                            if buffered_rows[split] >= WRITE_BATCH_ROWS:
+                                flush_tables(split)
+                        finally:
+                            Path(shard).unlink(missing_ok=True)
+                    next_index += 1
+                    replay_count = len(seen_replays)
+                    if replay_count - reported_replays >= 500:
+                        elapsed = time.perf_counter() - build_started
+                        print(f'LGPSDataset: {replay_count:,} replays, '
+                              f'{replay_count / elapsed:.2f} replays/s')
+                        reported_replays = replay_count
+            for split in table_buffers:
+                flush_tables(split)
+        finally:
+            for writer in writers.values():
+                writer.close()
+    if test_year is not None and (counts['train'] == 0 or counts['test'] == 0
+                                  or set(writers) != {'train', 'test'}):
+        raise RuntimeError(f'parallel dataset split is empty or has no rows: {counts}')
+    elapsed = time.perf_counter() - build_started
+    print(f'LGPSDataset: {len(seen_replays):,} replays, '
+          f'{len(seen_replays) / elapsed:.2f} replays/s total')
     return {split: output_dir / f'{split}.parquet' for split in writers}
 
 
@@ -1256,13 +1822,25 @@ def source_is_raw(path):
         paths = ()
     if not paths:
         return False
-    raw = []
-    for candidate in paths:
-        if candidate.suffix.lower() == '.tar':
-            raw.append(True)
-        elif candidate.suffix.lower() == '.parquet':
-            schema = set(pq.ParquetFile(candidate).schema_arrow.names)
-            raw.append({'frame_number', 'frame_is_active', 'stint_id'}.issubset(schema))
-    if any(raw) and not all(raw):
-        raise ValueError('input_path cannot mix raw replay frames with prepared model data')
-    return all(raw)
+    candidate = paths[0]
+    if candidate.suffix.lower() == '.tar':
+        return True
+    schema = set(pq.ParquetFile(candidate).schema_arrow.names)
+    return {'frame_number', 'frame_is_active', 'stint_id'}.issubset(schema)
+
+
+def cleanup_training_cache(train_config):
+    # Delete temporary replay caches after a training run.
+    paths = (train_config.input_path, train_config.test_path)
+    cache_dirs = set()
+    for value in paths:
+        if value is None:
+            continue
+        path = Path(value)
+        if source_is_raw(path):
+            cache_root = Path(os.environ.get('LGPS_CACHE_DIR', Path(tempfile.gettempdir()) / 'lgps_cache'))
+            cache_key = hashlib.blake2b(str(path.resolve()).encode('utf-8'), digest_size=12).hexdigest()
+            cache_dirs.add(cache_root / cache_key)
+    for cache_dir in cache_dirs:
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)

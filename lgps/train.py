@@ -1,9 +1,11 @@
 import contextlib
+from dataclasses import fields, is_dataclass
 import importlib
 import inspect
 import json
 import math
 import os
+import random
 import socket
 import time
 import matplotlib.pyplot as plt
@@ -14,13 +16,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from pathlib import Path
-from .config import LGPSRuntimeConfig, OUTPUT_DIR
-from .aux_tasks import LGPSBallStateAux, LGPSGradNorm, LGPSNextTouchAux, LGPSPlayerStateAux
-from .targets import collapse_probabilities
+from .config import LGPSRuntimeConfig, OUTPUT_DIR, normalize_lgps_train_config
+from .targets import bucket_edges, collapse_probabilities, open_horizon
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score, roc_curve
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
-from .dataset import LGPSData
+from .dataset import LGPSDataset, cleanup_training_cache
 from .model import LGPSTransformer
 
 plt.switch_backend("Agg")
@@ -59,10 +60,9 @@ class DistributedContext:
     def is_main(self):
         return self.rank == 0
 
-    def print(self, *args, **kwargs):
+    def print(self, *args):
         if self.is_main:
-            kwargs.setdefault("flush", True)
-            print(*args, **kwargs)
+            print(*args)
 
     def barrier(self):
         if self.is_distributed:
@@ -75,41 +75,143 @@ class DistributedContext:
 
 class WandbAdapter:
     # Optional Weights & Biases reporting adapter.
-    def __init__(self, project, entity=None, name=None, mode=None):
+    def __init__(self, project, entity=None, name=None, mode=None, config=None):
         try:
             wandb = importlib.import_module("wandb")
         except ImportError as error:
             raise ImportError("W&B reporting requires `pip install wandb`") from error
         self.wandb = wandb
-        self.run = wandb.init(project=project, entity=entity, name=name, mode=mode)
-        self.run.define_metric('train/batch')
-        self.run.define_metric('train/*', step_metric='train/batch')
-        for split in ('validation', 'test'):
-            self.run.define_metric(f'{split}/epoch')
-            self.run.define_metric(f'{split}/*', step_metric=f'{split}/epoch')
+        self.run = wandb.init(
+            project=project, entity=entity, name=name, mode=mode,
+            config=config or {},
+        )
 
-    def log_training(self, metrics, batch, epoch):
-        # Training curves receive one point per optimizer microbatch.
-        payload = {'train/batch': int(batch), 'train/epoch': int(epoch)}
-        payload.update({f'train/{key}': value for key, value in metrics.items()})
+    def log_round_metrics(self, round_index, loss, calibration_error):
+        self.run.log(
+            {
+                'val/loss/goal': float(loss),
+                'val/calibration_error/goal': float(calibration_error),
+            },
+            step=int(round_index),
+            commit=True,
+        )
+
+    @staticmethod
+    def _config_value(value):
+        if is_dataclass(value):
+            return {
+                item.name: WandbAdapter._config_value(getattr(value, item.name))
+                for item in fields(value)
+            }
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): WandbAdapter._config_value(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [WandbAdapter._config_value(item) for item in value]
+        return value
+
+    @classmethod
+    def lgps_config(cls, model_config, train_config, runtime_config, *,
+                    batch_size_per_gpu, accumulation_steps, effective_batch_size):
+        return {
+            'model': cls._config_value(model_config),
+            'train': cls._config_value(train_config),
+            'runtime': cls._config_value(runtime_config),
+            'derived': {
+                'num_outputs': model_config.num_outputs,
+                'batch_size_per_gpu': int(batch_size_per_gpu),
+                'physical_global_batch_size': int(batch_size_per_gpu * runtime_config.world_size),
+                'gradient_accumulation_steps': int(accumulation_steps),
+                'effective_global_batch_size': int(effective_batch_size),
+            },
+        }
+
+    def log_validation(self, metrics, epoch, probabilities=None, targets=None,
+                       horizon_frame_rate=20):
+        payload = {}
+
+        # ROC and PR are curves over decision thresholds, not AUC trends over epochs.
+        # Log W&B's native curve plots from this epoch's predictions.
+        if probabilities is not None and targets is not None and len(targets):
+            class_names = ('blue', 'orange', 'neither')
+            roc_auc_values = [metrics.get(f'validation_{name}_roc_auc') for name in class_names]
+            pr_auc_values = [metrics.get(f'validation_{name}_pr_auc') for name in class_names]
+            if any(value is not None for value in roc_auc_values):
+                payload['val/roc_curve'] = self.wandb.plot.roc_curve(
+                    y_true=targets,
+                    y_probas=probabilities,
+                    labels=list(class_names),
+                    title='Goal ROC Curve',
+                )
+            if any(value is not None for value in pr_auc_values):
+                payload['val/pr_curve'] = self.wandb.plot.pr_curve(
+                    y_true=targets,
+                    y_probas=probabilities,
+                    labels=list(class_names),
+                    title='Goal Precision-Recall Curve',
+                )
+
+        horizon_values = []
+        horizon_frames = []
+        for second in range(1, 31):
+            value = metrics.get(f'validation_accuracy_horizon_{second}s')
+            if value is not None:
+                horizon_frames.append(second * horizon_frame_rate)
+                horizon_values.append(float(value))
+        if horizon_values:
+            payload['val/accuracy'] = self.wandb.plot.line_series(
+                xs=horizon_frames,
+                ys=[horizon_values],
+                keys=['goal'],
+                title='Goal Accuracy by Frames Until Goal',
+                xname='Frames Until Goal',
+            )
+
+        # Drop an absent custom plot instead of asking W&B to serialize None.
+        payload = {key: value for key, value in payload.items() if value is not None}
         self.run.log(payload)
 
-    def log_evaluation(self, metrics, epoch, split):
-        payload = {f'{split}/epoch': int(epoch)}
-        for key, value in metrics.items():
-            if key != "calibration_bins" and isinstance(value, (int, float, np.number)):
-                payload[f"{split}/{key}"] = value
-        if metrics.get("calibration_bins") is not None:
-            table = self.wandb.Table(columns=["horizon_seconds", "channel", "bin", "count", "mean_prediction", "mean_outcome"])
-            for horizon, horizon_bins in enumerate(metrics["calibration_bins"], start=1):
-                for channel, channel_bins in enumerate(horizon_bins):
-                    for bin_index, (count, prediction_sum, outcome_sum) in enumerate(channel_bins):
-                        count = float(count)
-                        table.add_data(horizon, ("confidence", "blue", "orange", "neither")[channel], bin_index,
-                                       count, float(prediction_sum) / count if count else None,
-                                       float(outcome_sum) / count if count else None)
-            payload[f"{split}/calibration_bins"] = table
-        self.run.log(payload)
+    def log_checkpoint_plots(self, output_dir, epoch):
+        files = {
+            'roc_auc': 'lgps_roc_auc.png',
+            'probability_distribution': 'lgps_probability_distribution.png',
+            'pr_auc': 'lgps_pr_auc.png',
+            'calibration': 'lgps_calibration.png',
+        }
+        payload = {}
+        for name, filename in files.items():
+            path = Path(output_dir) / filename
+            if path.is_file():
+                payload[f'val/checkpoint/{name}_plot'] = self.wandb.Image(
+                    str(path), caption=f'Validation checkpoint, epoch {epoch}'
+                )
+        if len(payload) > 1:
+            self.run.log(payload)
+
+    def log_test(self, metrics, output_dir, metrics_path):
+        payload = {}
+        files = {
+            'roc_auc': 'lgps_roc_auc.png',
+            'pr_auc': 'lgps_pr_auc.png',
+            'calibration': 'lgps_calibration.png',
+            'probability_distribution': 'lgps_probability_distribution.png',
+        }
+        for name, filename in files.items():
+            path = Path(output_dir) / filename
+            if path.is_file():
+                payload[f'test/{name}_plot'] = self.wandb.Image(
+                    str(path), caption=f'Test {name.replace("_", " ")}'
+                )
+        if payload:
+            self.run.log(payload)
+        if Path(metrics_path).is_file():
+            artifact = self.wandb.Artifact('lgps-test-metrics', type='evaluation')
+            artifact.add_file(str(metrics_path), name='test/metrics.json')
+            self.run.log_artifact(artifact, aliases=['latest'])
+
+    def finish(self):
+        self.run.finish()
 
 
 class BatchDevice:
@@ -139,17 +241,27 @@ class BatchPrefetcher:
 
         next_batch = preload(next(iterator, None))
         while next_batch is not None:
-            torch.cuda.current_stream(self.device).wait_stream(stream)
+            current_stream = torch.cuda.current_stream(self.device)
+            current_stream.wait_stream(stream)
             batch = next_batch
+            for tensor in batch.values():
+                if isinstance(tensor, torch.Tensor):
+                    tensor.record_stream(current_stream)
             next_batch = preload(next(iterator, None))
             yield batch
 
 
 class LGPSClassificationMetrics:
-    def __init__(self, device, targets_per_team, store_predictions=False):
+    def __init__(self, device, targets_per_team, store_predictions=False, horizon_seconds=10.0,
+                 geometric_width=1.0, horizon_max=30.0, two_way_prediction=False):
         self.device = device
         self.targets_per_team = targets_per_team
+        self.horizon_seconds = None if open_horizon(horizon_seconds) else horizon_seconds
         self.store_predictions = store_predictions
+        self.geometric_width = geometric_width
+        self.horizon_max = float(horizon_max)
+        self.horizon_steps = int(math.floor(self.horizon_max))
+        self.two_way_prediction = bool(two_way_prediction)
 
         # Keep metric sums rather than storing every prediction for the epoch.
         self.loss_sum = torch.zeros(
@@ -177,12 +289,18 @@ class LGPSClassificationMetrics:
             device=device,
             dtype=torch.float64,
         )
+        if self.horizon_seconds is None:
+            self.horizon_correct = torch.zeros(self.horizon_steps, device=device, dtype=torch.float64)
+            self.horizon_count = torch.zeros(self.horizon_steps, device=device, dtype=torch.float64)
         self.probabilities = []
         self.targets = []
 
     @torch.no_grad()
-    def update(self, loss, logits, targets, _unused=None):
-        probabilities = collapse_probabilities(logits.detach().float().softmax(dim=-1), self.targets_per_team)
+    def update(self, loss, logits, targets, horizon_targets=None):
+        probabilities = collapse_probabilities(
+            logits.detach().float().softmax(dim=-1), self.targets_per_team, self.horizon_seconds,
+            self.two_way_prediction,
+        )
         n = targets.shape[0]
 
         # Report the same joint soft temporal CE optimized by training.
@@ -210,6 +328,40 @@ class LGPSClassificationMetrics:
         ).sum().double()
 
         self.count += n
+
+        if self.horizon_seconds is None:
+            if horizon_targets is None:
+                raise ValueError("open-horizon metrics require per-horizon targets")
+            team_width = self.targets_per_team
+            full = logits.detach().float().softmax(dim=-1)
+            team_bucket_probabilities = full[:, :2 * team_width].reshape(n, 2, team_width)
+            edges = torch.as_tensor(
+                bucket_edges(self.targets_per_team, self.geometric_width, None, self.horizon_max),
+                device=self.device,
+                dtype=team_bucket_probabilities.dtype,
+            )
+            horizon_count = min(self.horizon_steps, horizon_targets.shape[1])
+            horizons = torch.arange(1, horizon_count + 1, device=self.device, dtype=edges.dtype)
+            regular_fraction = (
+                (horizons[:, None] - edges[:-1])
+                / (edges[1:] - edges[:-1])
+            ).clamp(0.0, 1.0)
+            # The final per-team bucket is open ended. Its mass has no
+            # resolution within horizon_max, so it stays outside finite-horizon mass.
+            bucket_fraction = torch.cat(
+                (regular_fraction, torch.zeros((horizon_count, 1), device=self.device, dtype=edges.dtype)),
+                dim=1,
+            )
+            team_by_horizon = torch.einsum(
+                "nbk,hk->nhb", team_bucket_probabilities, bucket_fraction
+            )
+            neither_by_horizon = 1.0 - team_by_horizon.sum(dim=-1, keepdim=True)
+            horizon_probabilities = torch.cat((team_by_horizon, neither_by_horizon), dim=-1)
+            horizon_predictions = horizon_probabilities.argmax(dim=-1)
+            self.horizon_correct[:horizon_count] += (
+                horizon_predictions == horizon_targets[:, :horizon_count].long()
+            ).sum(dim=0).double()
+            self.horizon_count[:horizon_count] += n
 
         if self.store_predictions:
             # Keep validation outputs on-device until the final distributed gather.
@@ -303,58 +455,73 @@ class LGPSClassificationMetrics:
             )
         )
 
+        if self.horizon_seconds is None:
+            totals = torch.cat((totals, self.horizon_correct, self.horizon_count))
+
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(
                 totals,
                 op=dist.ReduceOp.SUM,
             )
 
-        loss_sum, correct, collapsed_three_way_loss_sum, brier_sum, count = totals
+        loss_sum, correct, collapsed_three_way_loss_sum, brier_sum, count = totals[:5]
 
         if count.item() == 0:
             raise RuntimeError("The data split produced zero usable rows.")
 
-        return {
+        result = {
             "loss": (loss_sum / count).item(),
             "collapsed_three_way_loss": (collapsed_three_way_loss_sum / count).item(),
             "accuracy": (correct / count).item(),
             "brier": (brier_sum / count).item(),
             "examples": int(count.item()),
         }
+        if self.horizon_seconds is None:
+            correct_by_horizon = totals[5:5 + self.horizon_steps]
+            count_by_horizon = totals[5 + self.horizon_steps:5 + 2 * self.horizon_steps]
+            for index in range(self.horizon_steps):
+                result[f"accuracy_horizon_{index + 1}s"] = (
+                    correct_by_horizon[index] / count_by_horizon[index]
+                ).item()
+        return result
 
 
 class LGPSTrainingMetrics:
     # Accumulate inexpensive metrics during training.
 
-    def __init__(self, device, targets_per_team):
+    def __init__(self, device, targets_per_team, horizon_seconds=10.0,
+                 two_way_prediction=False):
         self.targets_per_team = targets_per_team
+        self.horizon_seconds = horizon_seconds
+        self.two_way_prediction = bool(two_way_prediction)
         self.loss = torch.zeros((), device=device, dtype=torch.float64)
-        self.primary_loss = torch.zeros((), device=device, dtype=torch.float64)
         self.brier = torch.zeros((), device=device, dtype=torch.float64)
         self.examples = torch.zeros((), device=device, dtype=torch.float64)
 
     @torch.no_grad()
-    def update(self, loss, primary_loss, logits, targets):
-        probabilities = collapse_probabilities(logits.detach().float().softmax(dim=-1), self.targets_per_team)
+    def update(self, loss, logits, targets):
+        probabilities = collapse_probabilities(
+            logits.detach().float().softmax(dim=-1), self.targets_per_team, self.horizon_seconds,
+            self.two_way_prediction,
+        )
         count = targets.shape[0]
         self.loss += loss.detach().double() * count
-        self.primary_loss += primary_loss.detach().double() * count
         target_probability = probabilities.gather(1, targets[:, None]).squeeze(1)
         self.brier += (probabilities.square().sum(dim=-1) - 2 * target_probability + 1).sum().double()
         self.examples += count
 
     def compute(self):
-        totals = torch.stack((self.loss, self.primary_loss, self.brier, self.examples))
+        totals = torch.stack((self.loss, self.brier, self.examples))
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-        loss, primary_loss, brier, examples = totals
+        loss, brier, examples = totals
         if not examples.item():
             raise RuntimeError("no training examples were observed")
-        return {
+        result = {
             "loss": (loss / examples).item(),
-            "primary_loss": (primary_loss / examples).item(),
             "brier": (brier / examples).item(),
         }
+        return result
 
 
 class LGPSResults:
@@ -365,7 +532,15 @@ class LGPSResults:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_losses = []
         self.history = []
+        self.round_metrics = []
         self.final_metrics = {}
+
+    def add_round_metrics(self, round_index, loss, calibration_error):
+        self.round_metrics.append({
+            'round': int(round_index),
+            'round_loss': float(loss),
+            'round_calibration_error': float(calibration_error),
+        })
 
     @staticmethod
     def _json_value(value):
@@ -381,6 +556,20 @@ class LGPSResults:
         if isinstance(value, float) and not np.isfinite(value):
             return None
         return value
+
+    @staticmethod
+    def _reported_metrics(metrics):
+        return {
+            key: value for key, value in metrics.items()
+            if not key.startswith("train_")
+        }
+
+    @classmethod
+    def _metrics_payload(cls, latest, history):
+        return {
+            "latest": cls._reported_metrics(latest),
+            "history": [cls._reported_metrics(row) for row in history],
+        }
 
     @staticmethod
     def _safe_auc(metric, labels, scores):
@@ -539,12 +728,10 @@ class LGPSResults:
         self.final_metrics = metrics
         self._write_plots(probabilities, targets)
 
-        payload = {
-            "latest": metrics,
-            "history": self.history,
-        }
+        metrics_payload = self._metrics_payload(metrics, self.history)
+        metrics_payload['rounds'] = self.round_metrics
         (self.output_dir / "metrics.json").write_text(
-            json.dumps(self._json_value(payload), indent=2),
+            json.dumps(self._json_value(metrics_payload), indent=2),
             encoding="utf-8",
         )
 
@@ -562,6 +749,7 @@ class LGPSTrainer:
         model_config,
         runtime_config=None,
     ):
+        config = normalize_lgps_train_config(config)
         self.model = model
         self.train_loader = train_loader
         self.validation_loader = validation_loader
@@ -575,7 +763,6 @@ class LGPSTrainer:
             world_size=context.world_size,
         )
         self.batch_size = self.runtime_config.per_gpu_batch_size or config.batch_size
-        self.validation_batch_size = config.validation_batch_size
         physical_batch_size = (
             self.batch_size * self.context.world_size
         )
@@ -590,22 +777,16 @@ class LGPSTrainer:
             physical_batch_size * self.accumulation_steps
         )
         self.results = LGPSResults(OUTPUT_DIR)
-        future_frames = config.future_frames or ()
-        self.aux_task_names = tuple(
-            ([f'ball_{frame}' for frame in future_frames]
-             if LGPSBallStateAux in config.aux_tasks else [])
-            + ([f'player_{frame}' for frame in future_frames]
-               if LGPSPlayerStateAux in config.aux_tasks else [])
-            + (['next_touch'] if LGPSNextTouchAux in config.aux_tasks else [])
-        )
-        self.gradnorm = LGPSGradNorm(
-            self.aux_task_names, alpha=config.gradnorm_alpha,
-            momentum=config.gradnorm_momentum, device=self.device,
-        )
         self.training_step = 0
         self.wandb_adapter = (
             WandbAdapter(self.runtime_config.wandb_project, self.runtime_config.wandb_entity,
-                         self.runtime_config.wandb_run_name, self.runtime_config.wandb_mode)
+                         self.runtime_config.wandb_run_name, self.runtime_config.wandb_mode,
+                         config=WandbAdapter.lgps_config(
+                             model_config, config, self.runtime_config,
+                             batch_size_per_gpu=self.batch_size,
+                             accumulation_steps=self.accumulation_steps,
+                             effective_batch_size=self.effective_batch_size,
+                         ))
             if self.runtime_config.wandb_project is not None and context.is_main else None
         )
 
@@ -664,13 +845,13 @@ class LGPSTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
     def optimizer_step(self, examples):
-        # DDP averages rank gradients; normalize by the actual accumulated rows.
         correction = self.effective_batch_size / examples
         for parameter in self.model.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(correction)
 
-        self.scaler.unscale_(self.optimizer)
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(self.optimizer)
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
             self.config.gradient_clip_norm,
@@ -688,6 +869,36 @@ class LGPSTrainer:
         self.zero_grad()
         return gradient_norm
 
+    @torch.no_grad()
+    def batch_loss_and_calibration_error(self, loss, logits, targets):
+        probabilities = collapse_probabilities(
+            logits.detach().float().softmax(dim=-1),
+            self.model_config.targets_per_team,
+            self.model_config.horizon_seconds,
+            self.model_config.two_way_prediction,
+        )
+        confidence, prediction = probabilities.max(dim=-1)
+        correct = (prediction == targets).to(torch.float64)
+        confidence = confidence.to(torch.float64)
+        bin_count = 15
+        bin_index = (confidence * bin_count).long().clamp_max(bin_count - 1)
+        stats = torch.zeros((bin_count, 3), dtype=torch.float64, device=self.device)
+        ones = torch.ones_like(confidence)
+        stats[:, 0].scatter_add_(0, bin_index, ones)
+        stats[:, 1].scatter_add_(0, bin_index, confidence)
+        stats[:, 2].scatter_add_(0, bin_index, correct)
+        weighted_loss = torch.stack((loss.detach().double() * targets.numel(),
+                                     torch.tensor(float(targets.numel()), device=self.device, dtype=torch.float64)))
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            dist.all_reduce(weighted_loss, op=dist.ReduceOp.SUM)
+        active = stats[:, 0] > 0
+        calibration_error = (
+            (stats[active, 0] / stats[:, 0].sum())
+            * (stats[active, 2] / stats[active, 0] - stats[active, 1] / stats[active, 0]).abs()
+        ).sum()
+        return (weighted_loss[0] / weighted_loss[1]).item(), calibration_error.item()
+
     def training_batches(self):
         iterator = iter(BatchPrefetcher(self.train_loader, self.device))
 
@@ -696,7 +907,7 @@ class LGPSTrainer:
             local_count = 0 if batch is None else batch["temporal_targets"].shape[0]
             if local_count == 0:
                 return None
-            return batch, local_count, local_count * self.context.world_size
+            return batch, local_count
 
         while True:
             local_group = [next_batch() for _ in range(self.accumulation_steps)]
@@ -714,7 +925,12 @@ class LGPSTrainer:
             # accumulation group to the shortest rank so every DDP backward
             # issues the same collectives; discard at most three batches/rank.
             for group_index, current in enumerate(local_group[:shared_available]):
-                yield (*current, group_index + 1 == shared_available)
+                batch, local_count = current
+                global_count = torch.tensor(local_count, device=self.device, dtype=torch.int64)
+                if self.context.is_distributed:
+                    dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+                yield (batch, local_count, int(global_count.item()),
+                       group_index + 1 == shared_available)
             if shared_available < self.accumulation_steps:
                 return
 
@@ -731,231 +947,133 @@ class LGPSTrainer:
             model = model._orig_mod
         return model
 
-    def forward(self, batch, evaluation=False):
+    def forward(self, batch, evaluation=False, model_override=None):
         # Uneven validation shards must not issue DDP forward collectives.
-        model = self.raw_model if evaluation else self.model
+        model = model_override or (self.raw_model if evaluation else self.model)
+
         def call_model(ball):
             return model(
                 ball, batch["players"], batch["goals"], batch["entity_types"],
                 batch["entity_teams"], batch["game_context"], batch.get("big_boosts"),
-                batch.get("small_boosts"), return_aux=not evaluation and bool(self.aux_task_names),
+                batch.get("small_boosts"),
+                camera_features=batch.get('camera_features'),
+                camera_visible=batch.get('camera_visible'),
+                camera_valid=batch.get('camera_valid'),
+                camera_age=batch.get('camera_age'),
+                camera_relation=batch.get('camera_relation'),
             )
-        if not evaluation and model.training and self.runtime_config.activation_checkpointing:
+        if (not evaluation and model_override is None and model.training
+                and self.config.activation_checkpointing):
             return checkpoint(call_model, batch["ball"], use_reentrant=False)
         return call_model(batch["ball"])
-
-    def auxiliary_losses(self, predictions, batch):
-        raw = self.raw_model
-        losses = {}
-        if LGPSBallStateAux in self.config.aux_tasks:
-            losses.update(raw.ball_state_aux.losses(predictions, batch['aux_ball_targets']))
-        if LGPSPlayerStateAux in self.config.aux_tasks:
-            losses.update(raw.player_state_aux.losses(predictions, batch['aux_player_targets']))
-        if LGPSNextTouchAux in self.config.aux_tasks:
-            losses['next_touch'] = raw.next_touch_aux.loss(
-                predictions['next_touch'], batch['aux_next_touch_slot'],
-                batch['aux_next_touch_seconds'],
-            )
-        return losses
-
     def train_epoch(self, epoch):
         self.model.train()
-
-        metrics = LGPSTrainingMetrics(self.device, self.model_config.targets_per_team)
+        metrics = LGPSTrainingMetrics(
+            self.device, self.model_config.targets_per_team, self.model_config.horizon_seconds,
+            self.model_config.two_way_prediction,
+        )
         start_time = time.perf_counter()
         last_log_time = start_time
         local_examples = 0
-
-        self.context.print(
-            f"Epoch {epoch}/{self.config.epochs} | training started"
-        )
-
+        self.context.print(f"Epoch {epoch}/{self.config.epochs} | training started")
         self.zero_grad()
-        gradient_norm = torch.zeros(
-            (),
-            device=self.device,
-        )
-
+        gradient_norm = torch.zeros((), device=self.device)
         accumulated_examples = 0
         for batch_index, (batch, local_count, global_count, is_last) in enumerate(
             self.training_batches(), start=1,
         ):
             if batch["ball"].device != self.device:
-                batch = BatchDevice.move(
-                    batch,
-                    self.device,
-                )
-
+                batch = BatchDevice.move(batch, self.device)
             accumulated_examples += global_count
-            synchronize = is_last
             sync_context = (
                 self.model.no_sync()
-                if self.context.is_distributed and not synchronize
+                if self.context.is_distributed and not is_last
                 else contextlib.nullcontext()
             )
-
-            # DDP synchronizes only the final microbatch in each accumulation
-            # group; the local gradients are accumulated without NCCL traffic.
             with sync_context:
                 with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=self.autocast_dtype,
+                    device_type=self.device.type, dtype=self.autocast_dtype,
                     enabled=self.amp_enabled,
                 ):
-                    output = self.forward(batch)
-                    logits, auxiliary_predictions, shared = output if self.aux_task_names else (output, {}, None)
-                    primary_loss = -(batch["temporal_targets"] * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-                    auxiliary_losses = self.auxiliary_losses(auxiliary_predictions, batch)
-                    raw_loss, task_weights = (
-                        self.gradnorm.combine(primary_loss, auxiliary_losses, shared)
-                        if self.aux_task_names else (primary_loss, {})
-                    )
-                    loss = raw_loss * (
-                        local_count * self.context.world_size / self.effective_batch_size
-                    )
-
-                self.scaler.scale(loss).backward()
-
-            if synchronize:
-                # Update once per effective batch, including a final partial
-                # group whose last backward pass performed synchronization.
+                    logits = self.forward(batch)
+                    loss = -(batch["temporal_targets"] * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+                    scaled_loss = loss * (local_count * self.context.world_size / self.effective_batch_size)
+                self.scaler.scale(scaled_loss).backward()
+            if is_last:
                 gradient_norm = self.optimizer_step(accumulated_examples)
                 accumulated_examples = 0
-
-            if local_count:
-                metrics.update(raw_loss, primary_loss, logits, batch["collapsed_targets"])
+            metrics.update(loss, logits, batch["collapsed_targets"])
             local_examples += local_count
             self.training_step += 1
-            if self.runtime_config.wandb_project is not None:
-                logged_losses = torch.stack(
-                    [raw_loss.detach(), primary_loss.detach()]
-                    + [auxiliary_losses[name][0].detach() for name in self.aux_task_names]
-                ).float()
-                if self.context.is_distributed:
-                    dist.all_reduce(logged_losses, op=dist.ReduceOp.SUM)
-                    logged_losses /= self.context.world_size
+            round_loss, round_calibration_error = self.batch_loss_and_calibration_error(
+                loss, logits, batch['collapsed_targets']
+            )
+            if self.context.is_main:
+                self.results.add_round_metrics(
+                    self.training_step, round_loss, round_calibration_error
+                )
                 if self.wandb_adapter is not None:
-                    self.wandb_adapter.log_training(
-                        {
-                            'loss': logged_losses[0].item(),
-                            'primary_loss': logged_losses[1].item(),
-                            **{f'aux/{name}': logged_losses[index + 2].item()
-                               for index, name in enumerate(self.aux_task_names)},
-                            **{f'weight/{name}': task_weights[name]
-                               for name in self.aux_task_names},
-                            'learning_rate': self.optimizer.param_groups[0]['lr'],
-                        },
-                        self.training_step, epoch,
+                    self.wandb_adapter.log_round_metrics(
+                        self.training_step, round_loss, round_calibration_error
                     )
-
-            # Only rank 0 prints progress to avoid duplicate console output.
-            if (
-                self.context.is_main
-                and batch_index % self.config.log_interval == 0
-            ):
+            if self.context.is_main and batch_index % self.config.log_interval == 0:
                 now = time.perf_counter()
                 elapsed = now - start_time
                 interval = now - last_log_time
-                global_examples_per_second = (
-                    local_examples * self.context.world_size / elapsed
-                    if elapsed > 0
-                    else 0.0
-                )
-
+                throughput = local_examples * self.context.world_size / elapsed if elapsed > 0 else 0.0
                 print(
-                    f"Epoch {epoch}/{self.config.epochs} | "
-                    f"batch {batch_index:,} | "
-                    f"loss {raw_loss.detach().item():.5f} | "
-                    f"goal {primary_loss.detach().item():.5f} | "
-                    f"grad {float(gradient_norm):.4f} | "
-                    f"lr {self.optimizer.param_groups[0]['lr']:.2e} | "
-                    f"local examples {local_examples:,} | "
-                    f"{global_examples_per_second:,.1f} global examples/s | "
+                    f"Epoch {epoch}/{self.config.epochs} | batch {batch_index:,} | "
+                    f"loss {loss.detach().item():.5f} | goal {loss.detach().item():.5f} | "
+                    f"grad {float(gradient_norm):.4f} | lr {self.optimizer.param_groups[0]['lr']:.2e} | "
+                    f"local examples {local_examples:,} | {throughput:,.1f} global examples/s | "
                     f"{interval:.1f}s since last log"
                 )
-
                 last_log_time = now
-
         if accumulated_examples:
-            # Every rank applies the same final partial accumulation group.
             gradient_norm = self.optimizer_step(accumulated_examples)
-
         result = metrics.compute()
         elapsed = time.perf_counter() - start_time
-
         self.context.print(
             f"Epoch {epoch}/{self.config.epochs} | training finished | "
-            f"loss {result['loss']:.5f} | "
-            f"goal {result['primary_loss']:.5f} | "
-            f"brier {result['brier']:.5f} | "
-            f"time {elapsed:.1f}s"
+            f"loss {result['loss']:.5f} | brier {result['brier']:.5f} | time {elapsed:.1f}s"
         )
-
         return result
-
     @torch.inference_mode()
     def evaluate(self, epoch, loader, label, store_predictions):
         self.model.eval()
-
         metrics = LGPSClassificationMetrics(
-            self.device,
-            self.model_config.targets_per_team,
+            self.device, self.model_config.targets_per_team,
             store_predictions=store_predictions,
+            horizon_seconds=self.model_config.horizon_seconds,
+            geometric_width=self.model_config.geometric_width,
+            horizon_max=self.model_config.horizon_max,
+            two_way_prediction=self.model_config.two_way_prediction,
         )
-
         start_time = time.perf_counter()
-
-        self.context.print(
-            f"Epoch {epoch}/{self.config.epochs} | {label} started"
-        )
-
+        self.context.print(f"Epoch {epoch}/{self.config.epochs} | {label} started")
         for batch_index, batch in enumerate(loader, start=1):
             batch = BatchDevice.move(batch, self.device)
-
             with torch.autocast(
-                device_type=self.device.type,
-                dtype=self.autocast_dtype,
+                device_type=self.device.type, dtype=self.autocast_dtype,
                 enabled=self.amp_enabled,
             ):
                 logits = self.forward(batch, evaluation=True)
                 loss = -(batch["temporal_targets"] * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-
-            metrics.update(loss, logits, batch["collapsed_targets"])
-
-            if (
-                self.context.is_main
-                and batch_index % self.config.log_interval == 0
-            ):
-                print(
-                    f"Epoch {epoch}/{self.config.epochs} | "
-                    f"{label} batch {batch_index:,}"
-                )
-
+            metrics.update(loss, logits, batch["collapsed_targets"], batch.get("horizon_targets"))
+            if self.context.is_main and batch_index % self.config.log_interval == 0:
+                print(f"Epoch {epoch}/{self.config.epochs} | {label} batch {batch_index:,}")
         result = metrics.compute()
         elapsed = time.perf_counter() - start_time
-        global_examples_per_second = (
-            result["examples"] / elapsed
-            if elapsed > 0
-            else 0.0
-        )
-        per_device_examples_per_second = (
-            global_examples_per_second / self.context.world_size
-        )
-
+        rate = result["examples"] / elapsed if elapsed > 0 else 0.0
         self.context.print(
             f"Epoch {epoch}/{self.config.epochs} | {label} finished | "
-            f"loss {result['loss']:.5f} | "
-            f"accuracy {result['accuracy']:.4f} | "
+            f"loss {result['loss']:.5f} | accuracy {result['accuracy']:.4f} | "
             f"collapsed three-way loss {result['collapsed_three_way_loss']:.5f} | "
-            f"brier {result['brier']:.5f} | "
-            f"examples {result['examples']:,} | "
-            f"time {elapsed:.1f}s | "
-            f"throughput {per_device_examples_per_second:,.1f}/device "
-            f"({global_examples_per_second:,.1f} global/s)"
+            f"brier {result['brier']:.5f} | examples {result['examples']:,} | "
+            f"time {elapsed:.1f}s | throughput {rate / self.context.world_size:,.1f}/device "
+            f"({rate:,.1f} global/s)"
         )
-
         return result, metrics.arrays()
-
     def fit(self):
         history = []
         best_validation_loss = float("inf")
@@ -1011,7 +1129,10 @@ class LGPSTrainer:
                 history.append(row)
                 if self.wandb_adapter is not None:
                     if self.validation_loader is not None:
-                        self.wandb_adapter.log_evaluation(validation_metrics, epoch, "validation")
+                        self.wandb_adapter.log_validation(
+                            row, epoch, probabilities=probabilities, targets=targets
+                        )
+                        self.wandb_adapter.log_checkpoint_plots(OUTPUT_DIR, epoch)
 
             if self.context.is_main:
                 print(
@@ -1021,7 +1142,10 @@ class LGPSTrainer:
                 print(
                     "Full epoch metrics:\n"
                     + json.dumps(
-                        LGPSResults._json_value({k:v for k,v in row.items() if not k.endswith("calibration_bins")}),
+                        LGPSResults._json_value({
+                            k: v for k, v in LGPSResults._reported_metrics(row).items()
+                            if not k.endswith("calibration_bins")
+                        }),
                         indent=2,
                     )
                 )
@@ -1041,8 +1165,6 @@ class LGPSTrainer:
                 torch.save(
                     {
                         "model_state_dict": self.raw_model.state_dict(),
-                        "gradnorm_initial": self.gradnorm.initial.cpu(),
-                        "gradnorm_weights": self.gradnorm.weights.cpu(),
                         "model_config": self.raw_model.config.__dict__,
                         "train_config": self.config.__dict__,
                         "epoch": epoch,
@@ -1050,7 +1172,6 @@ class LGPSTrainer:
                     },
                     checkpoint_path,
                 )
-
                 print(
                     f"Saved new best checkpoint: {checkpoint_path} | "
                     f"validation loss {best_validation_loss:.5f}"
@@ -1067,7 +1188,7 @@ class LGPSTrainer:
                 store_predictions=True,
             )
             if self.context.is_main:
-                self.results.update(
+                test_row = self.results.update(
                     epoch=self.config.epochs,
                     train_metrics=None,
                     evaluation_metrics=test_metrics,
@@ -1075,12 +1196,15 @@ class LGPSTrainer:
                     targets=test_targets,
                     label="test",
                 )
-                if self.wandb_adapter is not None:
-                    self.wandb_adapter.log_evaluation(test_metrics, self.config.epochs, "test")
                 print(
                     "Full test metrics:\n"
                     + json.dumps(
-                        LGPSResults._json_value({k:v for k,v in self.results.final_metrics.items() if not k.endswith("calibration_bins")}),
+                        LGPSResults._json_value({
+                            k: v for k, v in LGPSResults._reported_metrics(
+                                self.results.final_metrics
+                            ).items()
+                            if not k.endswith("calibration_bins")
+                        }),
                         indent=2,
                     )
                 )
@@ -1088,13 +1212,16 @@ class LGPSTrainer:
                 metrics_path.write_text(
                     json.dumps(
                         LGPSResults._json_value({
-                            "latest": self.results.final_metrics,
-                            "history": self.results.history,
+                            **LGPSResults._metrics_payload(
+                                self.results.final_metrics, self.results.history
+                            ),
                         }),
                         indent=2,
                     ),
                     encoding="utf-8",
                 )
+                if self.wandb_adapter is not None:
+                    self.wandb_adapter.log_test(test_row, OUTPUT_DIR, metrics_path)
 
         if self.context.is_main and self.validation_loader is None:
             checkpoint_path = OUTPUT_DIR / "lgps_transformer.pt"
@@ -1110,6 +1237,9 @@ class LGPSTrainer:
             )
             print(f"Saved final checkpoint: {checkpoint_path}")
 
+        if self.wandb_adapter is not None:
+            self.wandb_adapter.finish()
+
         self.context.print(
             "Training complete"
         )
@@ -1120,8 +1250,12 @@ class LGPSTrainer:
         return None
 
 def create_model(model_config, train_config):
-    return LGPSTransformer(config=model_config, aux_tasks=train_config.aux_tasks,
-                           future_frames=train_config.future_frames)
+    train_config = normalize_lgps_train_config(train_config)
+    return LGPSTransformer(
+        config=model_config,
+        player_view=train_config.player_view is not None,
+        camera_encoder_settings=train_config.player_view,
+    )
 
 
 def prepare_model(model_config, train_config, runtime_config, context):
@@ -1137,8 +1271,8 @@ def prepare_model(model_config, train_config, runtime_config, context):
             # participates in every step and DDP can skip its costly graph walk.
             "find_unused_parameters": runtime_config.find_unused_parameters,
             "gradient_as_bucket_view": True,
-            # static_graph is incompatible with no_sync gradient accumulation
-            # on the PyTorch build used by Kaggle/Modal T4 workers.
+            # static_graph is incompatible with this no_sync gradient
+            # accumulation path.
             "static_graph": False,
         }
         # Newer PyTorch releases batch gradient copies into each ready bucket.
@@ -1150,8 +1284,13 @@ def prepare_model(model_config, train_config, runtime_config, context):
 
 
 def build_trainer(model_config, train_config, context, runtime_config=None):
+    train_config = normalize_lgps_train_config(train_config)
     runtime_config = runtime_config or context.runtime_config
-    data = LGPSData(
+    process_seed = (train_config.seed + context.rank) % (2 ** 32)
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    loaders = LGPSDataset(
         train_config,
         model_config,
         runtime_config,
@@ -1160,9 +1299,9 @@ def build_trainer(model_config, train_config, context, runtime_config=None):
     )
     return LGPSTrainer(
         model=prepare_model(model_config, train_config, runtime_config, context),
-        train_loader=data.train_loader(),
-        validation_loader=data.validation_loader(),
-        test_loader=data.test_loader(),
+        train_loader=loaders.train_loader(),
+        validation_loader=loaders.validation_loader(),
+        test_loader=loaders.test_loader(),
         config=train_config,
         context=context,
         model_config=model_config,
@@ -1176,14 +1315,19 @@ def ddp_worker(rank, world_size, model_config, train_config, runtime_config, mas
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     torch.set_num_threads(1)
     context = DistributedContext(rank, world_size, runtime_config)
-    context.print(
-        f"Runtime: device={context.device} | distributed={context.is_distributed} | "
-        f"world_size={context.world_size}"
+    current_device = (
+        torch.cuda.current_device() if context.device.type == "cuda" else "cpu"
+    )
+    print(
+        f"Runtime: rank={context.rank} local_rank={context.local_rank} "
+        f"device={context.device} current_device={current_device} "
+        f"distributed={context.is_distributed} world_size={context.world_size}",
     )
     try:
         trainer = build_trainer(model_config, train_config, context, runtime_config)
@@ -1212,8 +1356,15 @@ def _ddp_bootstrap(
 
 
 def train_lgps(model_config, train_config, runtime_config):
+    if runtime_config.world_size < 1:
+        raise ValueError("world_size must be positive")
+    if runtime_config.device not in {"cpu", "cuda", "auto"}:
+        raise ValueError("device must be 'cpu', 'cuda', or 'auto'")
     available_gpus = torch.cuda.device_count()
-    if (runtime_config.device == "cuda" or runtime_config.world_size > 1) and runtime_config.world_size > available_gpus:
+    uses_cuda = runtime_config.device == "cuda" or (
+        runtime_config.device == "auto" and torch.cuda.is_available()
+    )
+    if uses_cuda and runtime_config.world_size > available_gpus:
         raise RuntimeError(
             f"runtime requests {runtime_config.world_size} GPU(s), "
             f"but only {available_gpus} are visible"
@@ -1230,7 +1381,10 @@ def train_lgps(model_config, train_config, runtime_config):
             history = trainer.fit()
             return history, trainer.results.final_metrics
         finally:
-            context.cleanup()
+            try:
+                context.cleanup()
+            finally:
+                cleanup_training_cache(train_config)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -1238,19 +1392,22 @@ def train_lgps(model_config, train_config, runtime_config):
 
     # Load PyTorch's worker reducers before spawning distributed processes.
     importlib.import_module("torch._utils")
-    mp.spawn(
-        _ddp_bootstrap,
-        args=(
-            world_size,
-            ddp_worker,
-            model_config,
-            train_config,
-            runtime_config,
-            master_port,
-        ),
-        nprocs=world_size,
-        join=True,
-    )
+    try:
+        mp.spawn(
+            _ddp_bootstrap,
+            args=(
+                world_size,
+                ddp_worker,
+                model_config,
+                train_config,
+                runtime_config,
+                master_port,
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+    finally:
+        cleanup_training_cache(train_config)
 
     metrics_path = OUTPUT_DIR / "metrics.json"
     

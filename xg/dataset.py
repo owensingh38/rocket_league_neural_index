@@ -545,18 +545,32 @@ def _segment_expr(team_size_column: str = 'model_team_size') -> pl.Expr:
 
 
 def _playlist_segment_expr() -> pl.Expr:
-    label = pl.col('replay_playlist_label').cast(pl.String, strict=False).str.to_lowercase()
+    label = (pl.col('replay_playlist_label').cast(pl.String, strict=False)
+             .str.to_lowercase().str.strip_chars())
     expression = pl.lit(None, dtype=pl.String)
     for segment in MODEL_SEGMENTS:
         expression = pl.when(label == segment).then(pl.lit(segment)).otherwise(expression)
     return expression
 
 
-def _strength_team_size_expr() -> pl.Expr:
-    strength = pl.col('frame_strength_state').cast(pl.String, strict=False)
-    left = strength.str.extract(r'^(\d+)v\d+$', 1).cast(pl.Int8, strict=False)
-    right = strength.str.extract(r'^\d+v(\d+)$', 1).cast(pl.Int8, strict=False)
+def _strength_team_sizes(strength_column: str = 'frame_strength_state') -> tuple[pl.Expr, pl.Expr]:
+    strength = pl.col(strength_column).cast(pl.String, strict=False).str.to_lowercase().str.strip_chars()
+    left = strength.str.extract(r'^(\d+)v\d+$', 1).cast(pl.Int32, strict=False)
+    right = strength.str.extract(r'^\d+v(\d+)$', 1).cast(pl.Int32, strict=False)
+    return left, right
+
+
+def _strength_team_size_expr(strength_column: str = 'frame_strength_state') -> pl.Expr:
+    left, right = _strength_team_sizes(strength_column)
     return pl.max_horizontal(left, right)
+
+
+def _strength_is_allowed_expr(strength_column: str = 'frame_strength_state') -> pl.Expr:
+    left, right = _strength_team_sizes(strength_column)
+    strength = pl.col(strength_column).cast(pl.String, strict=False).str.strip_chars()
+    missing = strength.is_null() | (strength == '')
+    parsed_allowed = left.is_between(1, 3) & right.is_between(1, 3)
+    return (missing | parsed_allowed).fill_null(False)
 
 
 def _timeline_events(timeline: pl.DataFrame) -> pl.DataFrame:
@@ -982,12 +996,15 @@ def _scan_frame_paths(
         ])
         .cache()
     )
-    shot_frames = _explode_event_ids(base_frames, 'shot', '_shot_event_id')
+    shot_frames = _explode_event_ids(base_frames, 'shot', '_shot_event_id').filter(
+        _strength_is_allowed_expr()
+    )
     goal_frames = _explode_event_ids(base_frames, 'goal', '_goal_event_id')
     # Modal frame strength owns private replay mode; labels are an explicit fallback.
     replay_segments = (
         _scan_replay_mode_batches(paths, selected_replay_ids)
         .with_columns(_strength_team_size_expr().alias('strength_team_size'))
+        .filter(_strength_is_allowed_expr())
         .group_by(['replay_id', 'frame_strength_state', 'strength_team_size'])
         .agg([
             pl.len().alias('strength_frame_count'),
@@ -1436,7 +1453,6 @@ def _project_ball_with_bounces(
     ball_vz: np.ndarray,
     seconds: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Advance a 3D ball path with side/end-wall, floor, and ceiling rebounds."""
     x = np.asarray(ball_x, dtype=np.float64).copy()
     y = np.asarray(ball_y, dtype=np.float64).copy()
     z = np.asarray(ball_z, dtype=np.float64).copy()

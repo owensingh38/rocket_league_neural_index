@@ -4,12 +4,16 @@ datasets
 misc
 rlti
 tests
+!tests/
+tests/*
+!tests/test_lgps_targets.py
 results/rlti
 inference/output
 __pycache__
 .kaggle_*
 .cargo
 .pytest_cache
+.lgps_cache/
 *-metadata.json
 *.pt
 *.pt.tch.json

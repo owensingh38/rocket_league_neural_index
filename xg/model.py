@@ -326,7 +326,6 @@ def _write_evaluation(
     )
     shap_values = np.asarray(contributions[:, :-1], dtype=np.float32)
     np.save(output / f'shap_values_{segment}.npy', shap_values)
-    mean_abs_shap = np.nanmean(np.abs(shap_values), axis=0)
 
     shap.summary_plot(
         shap_values,
