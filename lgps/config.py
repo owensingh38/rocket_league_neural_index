@@ -1,10 +1,14 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from pathlib import Path
-from props import DATA_DIR, INPUT_DIR
-from .camera import PlayerCameraViewEncoder
+from shared import DATA_DIR, INPUT_DIR, OptimizerName
 from .targets import output_count
+from .aux_tasks import (
+    LGPSBallStateAux, LGPSNextTouchAux,
+)
 
 OUTPUT_DIR = DATA_DIR / "results" / "lgps"
+
+LGPSOptimizer = OptimizerName
 
 @dataclass(frozen=True)
 class LGPSModelConfig:
@@ -41,7 +45,9 @@ class LGPSTrainConfig:
     validation_batch_size: int = 8192
     effective_batch_size: int = 65536
     epochs: int = 10
+    optimizer: LGPSOptimizer = "Hybrid"
     learning_rate: float = 3e-4
+    muon_learning_rate: float = 2e-2
     min_learning_rate: float = 1e-6
     weight_decay: float = 1e-2
     gradient_clip_norm: float = 1.0
@@ -50,24 +56,12 @@ class LGPSTrainConfig:
     train_split: float = 0.95
     val_split: float = 0.05
     log_interval: int = 100
-    # Exclude stints with no qualifying next goal from training/evaluation data.
+    gradnorm_alpha: float = 1.5
+    gradnorm_momentum: float = 0.9
+    aux_tasks: tuple[object, ...] | list[object] | None = None
+    # Remove rows from stints that finish without either team scoring.
     drop_neither: bool = False
-    player_view: PlayerCameraViewEncoder.Settings | bool | None = field(
-        default_factory=PlayerCameraViewEncoder.Settings,
-    )
-
-def normalize_lgps_train_config(config):
-    # Normalize the camera shorthand where the config enters training.
-    camera = config.player_view
-    if camera is True:
-        camera = PlayerCameraViewEncoder.Settings()
-    elif camera is False:
-        camera = None
-    elif camera is not None and not isinstance(camera, PlayerCameraViewEncoder.Settings):
-        raise TypeError('player_view must be a camera encoder Settings object, True, or None')
-    if camera is config.player_view:
-        return config
-    return replace(config, player_view=camera)
+    store_model_checkpoint: bool = False
 
 @dataclass(frozen=True)
 class LGPSRuntimeConfig:
@@ -81,7 +75,6 @@ class LGPSRuntimeConfig:
     prefetch_factor: int = 4
     pin_memory: bool = True
     persistent_workers: bool = True
-    drop_last: bool = True
     compile_mode: str | None = None
     wandb_project: str | None = None
     wandb_entity: str | None = None
@@ -98,18 +91,19 @@ DEFAULT_MODEL_CONFIG = LGPSModelConfig(
     pairwise_rank=32,
     dropout=0.05,
     two_way_prediction=False,
-    targets_per_team=14,
+    targets_per_team=10,
     geometric_width=1.5,
-    horizon_seconds=None,
-    horizon_max=30.0,
+    horizon_seconds=10.0,
+    horizon_max=10.0,
     sample_rate=10.0,
     model_entities=["players", "ball", "goals", "big_boosts", "context"]
 )
 
 DEFAULT_TRAIN_CONFIG = LGPSTrainConfig(
     input_path=INPUT_DIR,
+    optimizer="Hybrid",
     activation_checkpointing=False,
-    drop_neither=False,
+    drop_neither=True,
     batch_size=8192,
     validation_batch_size=8192,
     effective_batch_size=65536,
@@ -121,7 +115,22 @@ DEFAULT_TRAIN_CONFIG = LGPSTrainConfig(
     train_split=0.95,
     val_split=0.05,
     log_interval=100,
-    player_view=None
+    aux_tasks=[
+        LGPSBallStateAux.Settings(
+            future_frames=(1, 5, 10, 20),
+            hidden_dim=None,
+            num_hidden_layers=1,
+            dropout=0.0,
+            activation='gelu',
+            loss_beta=1.0,
+            continuous_loss_weight=1.0,
+            rotation_loss_weight=1.0,
+        ),
+        LGPSNextTouchAux.Settings()
+    ],
+    gradnorm_alpha=1.5,
+    gradnorm_momentum=0.9,
+    store_model_checkpoint=True
 )
 
 DEFAULT_RUNTIME_CONFIG = LGPSRuntimeConfig(
@@ -135,7 +144,6 @@ DEFAULT_RUNTIME_CONFIG = LGPSRuntimeConfig(
     prefetch_factor=2,
     pin_memory=True,
     persistent_workers=True,
-    drop_last=True,
     compile_mode=None,
     wandb_project="latent-goal-probability-state",
     wandb_entity="project-signal",

@@ -4,6 +4,7 @@
 
 Training Data: 
 Rocket League replays collected from the following seasons and parsed with the [AnalyzeRL Boxcars library](https://pypi.org/project/analyzerl-boxcars):
+- Season X
 - 2021-22
 - 2022-23
 - 2024
@@ -14,6 +15,7 @@ Rocket League replays collected from the following seasons and parsed with the A
 - 2026
 
 Replay Files were collected from the following sources:
+- https://www.kaggle.com/datasets/dster/rocket-league-rlcs-season-x-replays
 - https://www.kaggle.com/datasets/dster/rocket-league-rlcs-season-2021-22-replays
 - https://www.kaggle.com/datasets/dster/rocket-league-rlcs-season-2022-23-replays
 - https://www.kaggle.com/datasets/dster/rocket-league-rlcs-season-2024-replays
@@ -28,17 +30,9 @@ Given high-resolution information on the position of a Rocket  League replay fra
 
 Outputs from replay parsing yield data in 30 frames per second, or 30hz.  For each replay in these seasons, the full replay frames dataset is first downsampled into 10hz (hinged on the frames directly before a goal is scored) and then is reduced into mid-play frame states only.
 
-The current version of the model predicts a probability distribution, using bins of half a second in length, from a goal within half a second to a goal anytime after 30 seconds from a given frame.  Each team has 61 bins and a separate "neither" bin is predicted for 123 total bins.
-
-Model Metrics, Out-of-Sample Test Data:
-- Log Loss (Collapsed, Three-Way): 0.907315
-- Brier Score (Collapsed, Three-Way): 0.556622
-- Macro ROC-AUC: 0.719732
-- Macro PR-AUC: 0.569632
-
 ### Architecture
 
-```
+```text
 LGPSTransformer(
   (ball_stream): LGPSAgent(
     (network): Sequential(
@@ -50,7 +44,7 @@ LGPSTransformer(
   )
   (player_stream): LGPSAgent(
     (network): Sequential(
-      (0): Linear(in_features=58, out_features=128, bias=True)
+      (0): Linear(in_features=102, out_features=128, bias=True)
       (1): GELU(approximate='none')
       (2): Linear(in_features=128, out_features=128, bias=True)
       (3): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
@@ -66,7 +60,7 @@ LGPSTransformer(
   )
   (big_boost_stream): LGPSAgent(
     (network): Sequential(
-      (0): Linear(in_features=6, out_features=128, bias=True)
+      (0): Linear(in_features=7, out_features=128, bias=True)
       (1): GELU(approximate='none')
       (2): Linear(in_features=128, out_features=128, bias=True)
       (3): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
@@ -74,7 +68,7 @@ LGPSTransformer(
   )
   (context_token): LGPSAgent(
     (network): Sequential(
-      (0): Linear(in_features=4, out_features=128, bias=True)
+      (0): Linear(in_features=5, out_features=128, bias=True)
       (1): GELU(approximate='none')
       (2): Linear(in_features=128, out_features=128, bias=True)
       (3): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
@@ -128,10 +122,57 @@ LGPSTransformer(
     (1): Linear(in_features=256, out_features=128, bias=True)
     (2): GELU(approximate='none')
     (3): Dropout(p=0.05, inplace=False)
-    (4): Linear(in_features=128, out_features=123, bias=True)
+    (4): Linear(in_features=128, out_features=21, bias=True)
+  )
+  (ball_state_aux): LGPSBallStateAux(
+    (feedback_projection): Linear(in_features=13, out_features=128, bias=False)
+    (heads): ModuleDict(
+      (1): Sequential(
+        (0): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (1): Linear(in_features=128, out_features=128, bias=True)
+        (2): GELU(approximate='none')
+        (3): Linear(in_features=128, out_features=13, bias=True)
+      )
+      (5): Sequential(
+        (0): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (1): Linear(in_features=128, out_features=128, bias=True)
+        (2): GELU(approximate='none')
+        (3): Linear(in_features=128, out_features=13, bias=True)
+      )
+      (10): Sequential(
+        (0): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (1): Linear(in_features=128, out_features=128, bias=True)
+        (2): GELU(approximate='none')
+        (3): Linear(in_features=128, out_features=13, bias=True)
+      )
+      (20): Sequential(
+        (0): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (1): Linear(in_features=128, out_features=128, bias=True)
+        (2): GELU(approximate='none')
+        (3): Linear(in_features=128, out_features=13, bias=True)
+      )
+    )
+  )
+  (next_touch_aux): LGPSNextTouchAux(
+    (player_score): Linear(in_features=128, out_features=1, bias=True)
+    (global_score): Linear(in_features=128, out_features=128, bias=True)
+    (player_time): Linear(in_features=128, out_features=1, bias=True)
   )
 )
 ```
+
+### Results 
+
+Model Metrics, Out-of-Sample Test Data:
+- Log Loss (Collapsed, Three-Way): 0.396244
+- Brier Score (Collapsed, Three-Way): 0.204049
+- Macro ROC-AUC: 0.785107
+- Macro PR-AUC: 0.598422
+
+![LGPS Calibration](results/lgps/lgps_calibration.png)
+![LGPS ROC-AUC](results/lgps/lgps_roc_auc.png)
+![LGPS PR-AUC](results/lgps/lgps_pr_auc.png)
+![LGPS Probability Distribution](results/lgps/lgps_probability_distribution.png)
 
 ### Example Inference
 
@@ -162,14 +203,9 @@ with torch.inference_mode():
 probabilities = collapse_probabilities(logits.softmax(-1), model_config.targets_per_team).cpu().numpy()
 ```
 
-### Example In-Game Probabilities
-**Next Goal**
+### LGPS Architectural Summary
 
-![Next Goal probabilities for Worlds 2025 Wildcard Geekay G1](images/sample_next_goal.png)
-
-**Goal in Next 10 Seconds**
-
-![Goal-in-next-10-seconds probabilities for Worlds 2025 Wildcard Geekay G1](images/sample_goal_in_next_ten_seconds.png)
+![LGPS Architectural Summary](visualizations/lgps/lgps_architectural_summary_418EC78F4B71E4962A5B7594CDE40728_5645.png)
 
 ## [Expected Goals](https://www.kaggle.com/models/owensingh38/rl-expected-goals)
 
@@ -179,10 +215,15 @@ Using the frame that a shot is recorded in replay frame data, the touch initiati
 
 Because shot and goal events are not necessarily linked in replay data, this must be done heuristically.  These events are linked by looking back 120 frames (four seconds in our 30hz replay frames data) from the frame the goal is recorded and identifying an evaluated shot row in that interval, selecting the most recent shot by the goal scorer.
 
+### Results
+
 Model Metrics, Out-of-Sample Test Data:
-- Log Loss: 0.277829
-- Brier Score: 0.083646
-- ROC-AUC: 0.902553
+- Log Loss: 0.273570
+- Brier Score: 0.082013
+- ROC-AUC: 0.908891
+
+![Expected Goals Calibration](results/xg/standard/calibration_standard.png)
+![Expected Goals ROC-AUC](results/xg/standard/roc_auc_standard.png)
 
 ### Example Inference
 
@@ -200,7 +241,7 @@ artifact = joblib.load("results/xg/standard/xg_model_standard.joblib")
 with TemporaryDirectory() as directory:
     parse_replay(REPLAY, event_tagging=True).write_parquet(Path(directory) / "game_frames.parquet")
     shots = load_training_frames(
-        directory, model_segments=artifact["model_segment"], include_event_context=False
+        directory, model_segments=artifact["model_segment"]
     )
 
 features = prepare_model_data(shots)

@@ -7,8 +7,9 @@ import pyarrow.parquet as pq
 from scipy import sparse
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Sequence
 from .config import FRAMES_FOLDER, MODEL_SEGMENTS
+from shared import quaternion_to_rocket_league_euler
 
 FRAMES_FOLDER = str(FRAMES_FOLDER)
 SEGMENT_TEAM_SIZES = {'duels': 1, 'doubles': 2, 'standard': 3}
@@ -20,10 +21,10 @@ GOAL_CENTER_TO_POST = 892.755
 GOAL_HEIGHT = 642.775
 SIDE_WALL_X = 4096.0
 BACK_WALL_Y = 5120.0
-CEILING_Z = 2044.0
+CEILING_Z = 2048.0
 
 GRAVITY = 650.0
-BALL_RADIUS = 92.75
+BALL_RADIUS = 91.25
 CAR_MIN_INTERCEPT_SPEED = 500.0
 CAR_MAX_SPEED = 2300.0
 CAR_GROUND_SPEED_CAP = 1410.0
@@ -38,12 +39,6 @@ TRAJECTORY_SECONDS = 5.0
 TRAJECTORY_SAMPLES = 12
 AERIAL_INTERCEPT_Z = 300.0
 GOAL_PLANE_Y = BACK_WALL_Y
-HISTORY_HALF_LIFE_SECONDS = 8.0
-DOUBLE_TAP_SECONDS = 5.0
-DOUBLE_TAP_BACK_WALL_DISTANCE = 900.0
-DOUBLE_TAP_BACK_WALL_PROJECTION_SECONDS = 3.5
-WALL_SHOT_DISTANCE = 350.0
-CEILING_SHOT_DISTANCE = 350.0
 
 EVENT_TYPES = {
     1: 'kickoff', 2: 'game_join', 3: 'game_leave', 4: 'shot', 5: 'save',
@@ -55,13 +50,6 @@ EVENT_TYPES = {
 }
 
 EVENT_TYPE_IDS = {event_type: f'{event_id:02}' for event_id, event_type in EVENT_TYPES.items()}
-
-LAST_FRAME_CONTEXT_EVENTS = {
-    'shot', 'save', 'pass', 'missed_pass', 'missed_shot',
-    'air_dribble', 'ground_dribble', 'flick', 'demo', 'bump',
-    'retrieval', 'boost_pickup', 'flip_reset', 'press', 'shadow',
-    'fake', 'challenge', 'multi_commit', 'turnover',
-}
 
 EVENT_PLAYER_WIDTHS = {
     'game_join': MAX_PLAYERS,
@@ -82,26 +70,10 @@ EVENT_PLAYER_WIDTHS = {
     'multi_commit': MAX_PLAYERS,
 }
 
-HISTORY_EVENT_TYPES = (
-    'turnover', 'pass', 'shot', 'save',
-    'demo', 'bump', 'challenge', 'entry', 'exit', 'retrieval',
-    'whiff', 'shadow', 'press', 'fake', 'missed_pass', 'missed_shot',
-    'multi_commit', 'respawn',
-)
-
-OFF_COLUMNS = (
-    'off_demo', 'off_kickoff', 'off_challenge_win', 'off_bump',
-    'off_controlled_entry', 'off_controlled_exit', 'off_retrieval',
-    'off_uncontrolled_entry', 'off_uncontrolled_exit', 'off_air_dribble',
-    'off_ground_dribble', 'off_flick', 'off_pass', 'off_fake', 'off_whiff',
-    'off_flip_reset', 'off_wall', 'off_ceiling',
-)
-
 PLAYER_STATE_FIELDS = (
     'on_field', 'demoed', 'touching_ball',
     'throttle', 'steer', 'handbrake',
     'is_driving', 'is_powersliding', 'is_throttling', 'in_reverse',
-    'throttle_scaled', 'steer_scaled', 'boost_scaled',
     'supersonic',
     'is_boosting',
     'dodge_torque_x', 'dodge_torque_y', 'dodge_torque_z',
@@ -109,7 +81,7 @@ PLAYER_STATE_FIELDS = (
     'double_jump_impulse_x', 'double_jump_impulse_y', 'double_jump_impulse_z',
     'in_air', 'on_ground', 'on_ceiling', 'on_backwall', 'on_sidewall',
     'pitch', 'yaw', 'roll',
-    'is_jumping', 'is_single_jumping', 'is_double_jumping', 'is_dodging',
+    'is_jumping', 'is_single_jumping', 'is_double_jumping', 'is_dodging', 'is_holding_jump',
     'has_dodge', 'jumped', 'double_jumped', 'dodged',
     'pos_x', 'pos_y', 'pos_z',
     'vel_x', 'vel_y', 'vel_z',
@@ -119,7 +91,6 @@ PLAYER_STATE_FIELDS = (
 )
 
 SHOOTER_FIELDS = (*PLAYER_STATE_FIELDS,)
-PASSER_FIELDS = (*PLAYER_STATE_FIELDS,)
 DEFENDER_FIELDS = (*PLAYER_STATE_FIELDS,)
 
 PLAYER_FIELDS = (
@@ -153,12 +124,12 @@ PLAYER_FEATURE_ALIASES = {
 BASE_SOURCE_COLUMNS = (
     'replay_id', 'frame_number', 'frame_seconds_elapsed', 'event_type', 'event_id',
     'frame_strength_state', 'replay_playlist_label',
-    'shot_event_id', 'goal_event_id', 'pass_event_id',
+    'shot_event_id', 'goal_event_id',
     'frame_touch_team_id', 'frame_touch_player_slot',
     'event_player_1_slot',
     *(
         f'{event_type}_event_player_{event_player}_slot'
-        for event_type in ('shot', 'goal', 'pass')
+        for event_type in ('shot', 'goal')
         for event_player in range(1, MAX_PLAYERS + 1)
     ),
     'ball_pos_x', 'ball_pos_y', 'ball_pos_z',
@@ -169,25 +140,31 @@ BASE_SOURCE_COLUMNS = (
 def _normalize_segments(model_segments: Sequence[str] | str | None) -> tuple[str, ...]:
     if model_segments is None:
         return MODEL_SEGMENTS
+
     values = (model_segments,) if isinstance(model_segments, str) else tuple(model_segments)
     segments = tuple(dict.fromkeys(str(value).lower() for value in values))
     invalid = sorted(set(segments) - set(MODEL_SEGMENTS))
+
     if invalid:
         raise ValueError(f'Unknown model segments: {invalid}. Expected values from {MODEL_SEGMENTS}')
+
     if not segments:
         raise ValueError('model_segments must contain at least one segment')
+
     return segments
 
 
 def _frame_paths(frames_folder: str | Path) -> list[Path]:
     paths = sorted(Path(frames_folder).rglob('*.parquet'))
+
     if not paths:
         raise FileNotFoundError(f'No parquet files found in frames folder: {frames_folder}')
+
     return paths
 
 
-def _source_columns(include_event_context: bool = True) -> list[str]:
-    columns = [
+def _source_columns() -> list[str]:
+    return [
         *BASE_SOURCE_COLUMNS,
         *(
             f'player_{player_number}_{field}'
@@ -195,9 +172,6 @@ def _source_columns(include_event_context: bool = True) -> list[str]:
             for field in PLAYER_FIELDS
         ),
     ]
-    if include_event_context:
-        columns.extend(('stint_id', 'possession_id', 'possession_team'))
-    return columns
 
 
 @lru_cache(maxsize=65_536)
@@ -213,22 +187,29 @@ def _projected_schema(paths: Sequence[Path], columns: set[str]) -> pa.Schema:
     schemas = []
     sample_count = min(32, len(paths))
     sample_indices = np.linspace(0, len(paths) - 1, sample_count, dtype=np.int64)
+
     for index in np.unique(sample_indices):
         path = paths[int(index)]
         schema = _read_parquet_schema(str(path))
         fields = []
+
         for column in schema.names:
             if column not in columns:
                 continue
+
             field = schema.field(column)
             # Arrow 26 may infer ``string_view`` from one Parquet file and
             # ``large_string`` from another; unify_schemas cannot promote the
             # view type. Normalize views before constructing the dataset schema.
             is_string_view = getattr(pa.types, 'is_string_view', lambda _: False)
+
             if is_string_view(field.type):
                 field = pa.field(field.name, pa.string(), nullable=field.nullable, metadata=field.metadata)
+
             fields.append(field)
+
         schemas.append(pa.schema(fields))
+
     return pa.unify_schemas(schemas, promote_options='permissive')
 
 
@@ -258,19 +239,21 @@ def _scan_filtered_batches(
         pl.col(column) if column in available else pl.lit(None).alias(column)
         for column in requested
     )
+
     if selected_replay_ids is not None and 'replay_id' in available:
         frame = frame.filter(
             pl.col('replay_id').cast(pl.String, strict=False).is_in(selected_replay_ids)
         )
+
     return frame.filter(row_filter)
 
 
 def _scan_shot_goal_batches(
     paths: Sequence[Path],
     selected_replay_ids: Sequence[str] | None,
-    include_event_context: bool,
 ) -> pl.LazyFrame:
     schema_names = set(pq.read_schema(paths[0]).names)
+
     if 'event_type' in schema_names:
         row_filter = (
             pl.col('event_type').cast(pl.String, strict=False).is_in(['shot', 'goal'])
@@ -278,19 +261,23 @@ def _scan_shot_goal_batches(
         )
     elif {'shot_event_id', 'goal_event_id'} & schema_names:
         event_filters: list[pl.Expr] = []
+
         if 'shot_event_id' in schema_names:
             event_filters.append(pl.col('shot_event_id').is_not_null())
+
         if 'goal_event_id' in schema_names:
             event_filters.append(pl.col('goal_event_id').is_not_null())
+
         event_filters.append(pl.col('frame_touch_player_slot').is_not_null())
         row_filter = pl.any_horizontal(event_filters)
     elif 'event_id' in schema_names:
         row_filter = pl.col('event_id').is_not_null()
     else:
         raise ValueError('No event frame rows matched the requested replays')
+
     return _scan_filtered_batches(
         paths,
-        _source_columns(include_event_context),
+        _source_columns(),
         row_filter,
         selected_replay_ids,
     )
@@ -306,99 +293,6 @@ def _scan_replay_mode_batches(
         pl.col('replay_id').is_not_null(),
         selected_replay_ids,
     )
-
-
-def _pass_source_columns() -> list[str]:
-    return [
-        'replay_id', 'frame_number', 'frame_seconds_elapsed', 'event_type', 'event_id',
-        'pass_event_id', 'stint_id',
-        'event_player_1_slot',
-        *(f'pass_event_player_{event_player}_slot' for event_player in range(1, MAX_PLAYERS + 1)),
-        'ball_pos_x', 'ball_pos_y', 'ball_pos_z',
-        'ball_vel_x', 'ball_vel_y', 'ball_vel_z',
-        *(
-            f'player_{player_number}_{field}'
-            for player_number in range(1, MAX_PLAYERS + 1)
-            for field in PASSER_FIELDS
-        ),
-        *(
-            f'player_{player_number}_team'
-            for player_number in range(1, MAX_PLAYERS + 1)
-        ),
-    ]
-
-
-def _scan_pass_batches(
-    paths: Sequence[Path],
-    selected_replay_ids: Sequence[str] | None,
-) -> pl.LazyFrame:
-    schema_names = set(pq.read_schema(paths[0]).names)
-    if 'event_type' in schema_names:
-        row_filter = pl.col('event_type').cast(pl.String, strict=False) == 'pass'
-    elif 'pass_event_id' in schema_names:
-        row_filter = pl.col('pass_event_id').is_not_null()
-    elif 'event_id' in schema_names:
-        row_filter = pl.col('event_id').is_not_null()
-    else:
-        raise ValueError('No event frame rows matched the requested replays')
-    return _scan_filtered_batches(
-        paths,
-        _pass_source_columns(),
-        row_filter,
-        selected_replay_ids,
-    )
-
-
-def _timeline_columns() -> list[str]:
-    return list(dict.fromkeys([
-        'replay_id', 'frame_number', 'frame_seconds_elapsed', 'event_type', 'event_id',
-        'event_start_frame', 'event_end_frame', 'event_duration',
-        'stint_id', 'possession_id',
-        'ball_pos_x', 'ball_pos_y', 'ball_pos_z',
-        'ball_vel_x', 'ball_vel_y', 'ball_vel_z',
-        'possession_team', 'contested_possession', 'event_player_1_slot',
-        *(
-            column
-            for event_type in EVENT_TYPES.values()
-            for column in (
-                f'{event_type}_event_id',
-                f'{event_type}_event_player_1_slot',
-            )
-        ),
-        *(
-            f'player_{player_number}_rotation_role'
-            for player_number in range(1, MAX_PLAYERS + 1)
-        ),
-    ]))
-
-
-def _scan_timeline_batches(
-    paths: Sequence[Path],
-    selected_replay_ids: Sequence[str] | None,
-) -> pl.DataFrame:
-    schema_names = set(pq.read_schema(paths[0]).names)
-    if 'event_type' in schema_names:
-        row_filter = pl.col('event_type').is_not_null()
-    else:
-        event_columns = [
-            f'{event_type}_event_id'
-            for event_type in EVENT_TYPES.values()
-            if f'{event_type}_event_id' in schema_names
-        ]
-        if event_columns:
-            row_filter = pl.any_horizontal(pl.col(column).is_not_null() for column in event_columns)
-        elif 'event_id' in schema_names:
-            row_filter = pl.col('event_id').is_not_null()
-        else:
-            raise ValueError('No event frame rows matched the requested replays')
-        if 'possession_id' in schema_names:
-            row_filter = row_filter | (pl.col('possession_id').cast(pl.Int64, strict=False) != 0)
-    return _scan_filtered_batches(
-        paths,
-        _timeline_columns(),
-        row_filter,
-        selected_replay_ids,
-    ).collect(engine='streaming')
 
 
 def _event_id_expr(event_type: str) -> pl.Expr:
@@ -426,12 +320,14 @@ def _event_player_width(event_type: str) -> int:
 
 def _player_team_for_slot_expr(slot_expr: pl.Expr) -> pl.Expr:
     expression = pl.lit(None, dtype=pl.String)
+
     for player_number in range(1, MAX_PLAYERS + 1):
         expression = (
             pl.when(slot_expr == player_number)
             .then(pl.col(f'player_{player_number}_team'))
             .otherwise(expression)
         )
+
     return expression
 
 
@@ -444,6 +340,7 @@ def _event_player_slot_for_ordinal_expr(
     max_instances = max(1, MAX_PLAYERS // width)
     expression = pl.col('event_player_1_slot').cast(pl.Int8, strict=False)
     event_team = _event_team_expr(event_column)
+
     for ordinal in reversed(range(max_instances)):
         source_slot = 1 if event_type in {'pass', 'missed_pass'} else ordinal * width + 1
         source = pl.col(f'{event_type}_event_player_{source_slot}_slot').cast(pl.Int8, strict=False)
@@ -462,6 +359,7 @@ def _event_player_slot_for_ordinal_expr(
             .then(pl.coalesce(candidates))
             .otherwise(expression)
         )
+
     return expression.cast(pl.Int8, strict=False)
 
 
@@ -496,51 +394,30 @@ def _event_team_expr(event_column: str) -> pl.Expr:
     )
 
 
-def _event_type_name_expr() -> pl.Expr:
-    expression = pl.col('event_type').cast(pl.String, strict=False)
-    for event_id, event_type in reversed(tuple(EVENT_TYPES.items())):
-        expression = (
-            pl.when(pl.col('_event_type_id') == event_id)
-            .then(pl.lit(event_type))
-            .otherwise(expression)
-        )
-    return expression
-
-
-def _timeline_event_player_slot_expr() -> pl.Expr:
-    expression = pl.col('event_player_1_slot').cast(pl.Int8, strict=False)
-    for event_id, event_type in reversed(tuple(EVENT_TYPES.items())):
-        expression = (
-            pl.when(pl.col('_event_type_id') == event_id)
-            .then(pl.coalesce([
-                pl.col(f'{event_type}_event_player_1_slot'),
-                pl.col('event_player_1_slot'),
-            ]))
-            .otherwise(expression)
-        )
-    return expression.cast(pl.Int8, strict=False)
-
-
 def _slot_expr(
     field: str,
     dtype: pl.DataType,
     slot_column: str = 'event_player_1_slot',
 ) -> pl.Expr:
     expression = pl.lit(None, dtype=dtype)
+
     for player_number in range(1, MAX_PLAYERS + 1):
         expression = (
             pl.when(pl.col(slot_column) == player_number)
             .then(pl.col(f'player_{player_number}_{field}').cast(dtype, strict=False))
             .otherwise(expression)
         )
+
     return expression
 
 
 def _segment_expr(team_size_column: str = 'model_team_size') -> pl.Expr:
     team_size = pl.col(team_size_column).cast(pl.Int8, strict=False)
     expression = pl.lit(None, dtype=pl.String)
+
     for segment, size in reversed(tuple(SEGMENT_TEAM_SIZES.items())):
         expression = pl.when(team_size == size).then(pl.lit(segment)).otherwise(expression)
+
     return expression
 
 
@@ -548,8 +425,10 @@ def _playlist_segment_expr() -> pl.Expr:
     label = (pl.col('replay_playlist_label').cast(pl.String, strict=False)
              .str.to_lowercase().str.strip_chars())
     expression = pl.lit(None, dtype=pl.String)
+
     for segment in MODEL_SEGMENTS:
         expression = pl.when(label == segment).then(pl.lit(segment)).otherwise(expression)
+
     return expression
 
 
@@ -571,375 +450,6 @@ def _strength_is_allowed_expr(strength_column: str = 'frame_strength_state') -> 
     missing = strength.is_null() | (strength == '')
     parsed_allowed = left.is_between(1, 3) & right.is_between(1, 3)
     return (missing | parsed_allowed).fill_null(False)
-
-
-def _timeline_events(timeline: pl.DataFrame) -> pl.DataFrame:
-    # PBP rows are already event-wise; frame rows are normalized from event-owned columns.
-    if timeline['event_type'].null_count() < timeline.height:
-        events = (
-            timeline
-            .lazy()
-            .filter(pl.col('event_type').is_not_null() & pl.col('event_id').is_not_null())
-            .with_columns([
-                pl.col('event_id').cast(pl.String, strict=False).alias('_event_key'),
-                pl.col('event_player_1_slot').cast(pl.Int8, strict=False),
-            ])
-        )
-    elif 'event_id' in timeline.columns and timeline['event_id'].null_count() < timeline.height:
-        events = (
-            timeline
-            .lazy()
-            .filter(pl.col('event_id').is_not_null())
-            .with_columns([
-                pl.col('event_id')
-                .cast(pl.String, strict=False)
-                .str.split('|')
-                .alias('_event_key'),
-                pl.col('event_player_1_slot')
-                .cast(pl.Int8, strict=False)
-                .alias('event_player_1_slot'),
-                pl.lit(None, dtype=pl.String).alias('event_type'),
-            ])
-            .explode('_event_key')
-        )
-    else:
-        event_frames = []
-        for event_type in EVENT_TYPES.values():
-            event_id_column = f'{event_type}_event_id'
-            event_player_column = f'{event_type}_event_player_1_slot'
-            event_frames.append(
-                timeline
-                .lazy()
-                .filter(pl.col(event_id_column).is_not_null())
-                .with_columns([
-                    pl.col(event_id_column)
-                    .cast(pl.String, strict=False)
-                    .str.split('|')
-                    .alias('_event_key'),
-                    pl.col(event_player_column)
-                    .cast(pl.Int8, strict=False)
-                    .alias('event_player_1_slot'),
-                    pl.lit(event_type).alias('event_type'),
-                ])
-                .explode('_event_key')
-            )
-        events = pl.concat(event_frames, how='diagonal_relaxed')
-    events = (
-        events
-        .filter(pl.col('_event_key').str.len_chars() >= 3)
-        .with_columns([
-            pl.col('_event_key').str.slice(1, 2).cast(pl.Int8, strict=False).alias('_event_type_id'),
-            pl.col('_event_key').str.slice(0, 1).alias('_event_team_id'),
-        ])
-        .with_columns(_event_type_name_expr().alias('event_type'))
-    )
-    slot = _timeline_event_player_slot_expr()
-    role = pl.lit(None, dtype=pl.Float32)
-    for player_number in range(1, MAX_PLAYERS + 1):
-        role = (
-            pl.when(slot == player_number)
-            .then(pl.col(f'player_{player_number}_rotation_role').cast(pl.Float32, strict=False))
-            .otherwise(role)
-        )
-    normalized = (
-        events
-        .with_columns([
-            slot.alias('_event_player_slot'),
-            role.alias('_event_rotation_role'),
-            pl.col('stint_id').cast(pl.Int64, strict=False).alias('_event_stint_id'),
-            pl.when(pl.col('_event_team_id') == '0').then(pl.lit('blue'))
-            .when(pl.col('_event_team_id') == '1').then(pl.lit('orange'))
-            .otherwise(None).alias('_event_team'),
-            pl.coalesce([
-                pl.col('frame_seconds_elapsed').cast(pl.Float32, strict=False),
-                pl.col('frame_number').cast(pl.Float32, strict=False) / 30.0,
-            ]).alias('_event_seconds'),
-        ])
-        # Keep first-frame context while retaining the full ID-owned event span.
-        .with_columns([
-            pl.coalesce([
-                pl.col('event_start_frame').cast(pl.Int64, strict=False),
-                pl.col('frame_number').min().over(['replay_id', '_event_key']),
-            ]).alias('_event_start_frame'),
-            pl.coalesce([
-                pl.col('event_end_frame').cast(pl.Int64, strict=False),
-                pl.col('frame_number').max().over(['replay_id', '_event_key']),
-            ]).alias('_event_end_frame'),
-            pl.col('_event_seconds').max().over(['replay_id', '_event_key']).alias('_event_end_seconds'),
-        ])
-        .sort(['replay_id', '_event_key', 'frame_number'])
-    )
-    first_frame_events = (
-        normalized
-        .filter(~pl.col('event_type').is_in(LAST_FRAME_CONTEXT_EVENTS))
-        .unique(subset=['replay_id', '_event_key'], keep='first', maintain_order=True)
-    )
-    last_frame_events = (
-        normalized
-        .filter(pl.col('event_type').is_in(LAST_FRAME_CONTEXT_EVENTS))
-        .unique(subset=['replay_id', '_event_key'], keep='last', maintain_order=True)
-    )
-    return (
-        pl.concat([first_frame_events, last_frame_events], how='diagonal_relaxed')
-        .sort(['replay_id', 'frame_number', '_event_key'])
-        .unique(subset=['replay_id', '_event_key'], keep='first', maintain_order=True)
-        .collect(engine='streaming')
-    )
-
-
-def _near_offensive_back_wall(event: Mapping[str, Any], team: str) -> bool:
-    ball_y = event.get('ball_pos_y')
-    if ball_y is None or not np.isfinite(ball_y):
-        return False
-    offensive_y = -BACK_WALL_Y if team == 'orange' else BACK_WALL_Y
-    if abs(ball_y - offensive_y) <= DOUBLE_TAP_BACK_WALL_DISTANCE:
-        return True
-    ball_vy = event.get('ball_vel_y')
-    if ball_vy is None or not np.isfinite(ball_vy) or abs(ball_vy) <= 1e-6:
-        return False
-    time_to_wall = (offensive_y - ball_y) / ball_vy
-    if not 0.0 < time_to_wall <= DOUBLE_TAP_BACK_WALL_PROJECTION_SECONDS:
-        return False
-    ball_x = event.get('ball_pos_x')
-    ball_z = event.get('ball_pos_z')
-    ball_vx = event.get('ball_vel_x')
-    ball_vz = event.get('ball_vel_z')
-    if any(value is None or not np.isfinite(value) for value in (ball_x, ball_z, ball_vx, ball_vz)):
-        return False
-    projected_x, projected_y, projected_z = _project_ball_with_bounces(
-        np.asarray([ball_x]),
-        np.asarray([ball_y]),
-        np.asarray([ball_z]),
-        np.asarray([ball_vx]),
-        np.asarray([ball_vy]),
-        np.asarray([ball_vz]),
-        np.asarray([time_to_wall]),
-    )
-    return (
-        abs(projected_y[0] - offensive_y) <= 1.0
-        and abs(projected_x[0]) <= SIDE_WALL_X - BALL_RADIUS
-        and BALL_RADIUS <= projected_z[0] <= CEILING_Z - BALL_RADIUS
-    )
-
-
-def _event_context_features(timeline: pl.DataFrame, shots: pl.DataFrame) -> pl.DataFrame:
-    events = _timeline_events(timeline)
-    events_by_replay: dict[str, list[dict[str, Any]]] = {}
-    for event in events.iter_rows(named=True):
-        event_type = event.get('event_type') or EVENT_TYPES.get(event['_event_type_id'])
-        if event_type is None:
-            continue
-        event['event_type'] = event_type
-        events_by_replay.setdefault(event['replay_id'], []).append(event)
-
-    # Possession IDs own their full frame span, independent of intervening event rows.
-    possession_starts = {
-        (row['replay_id'], row['possession_id']): row['_possession_seconds']
-        for row in (
-            events
-            .lazy()
-            .filter(pl.col('possession_id').cast(pl.Int64, strict=False).fill_null(0) != 0)
-            .with_columns(pl.col('_event_seconds').alias('_possession_seconds'))
-            .group_by(['replay_id', 'possession_id'])
-            .agg(pl.col('_possession_seconds').min())
-            .collect(engine='streaming')
-            .iter_rows(named=True)
-        )
-    }
-
-    records = []
-    for shot in shots.iter_rows(named=True):
-        replay_events = events_by_replay.get(shot['replay_id'], [])
-        shot_frame = shot['_frame_order']
-        shot_seconds = shot.get('frame_seconds_elapsed')
-        if shot_seconds is None or not np.isfinite(shot_seconds):
-            shot_seconds = shot_frame / 30.0
-        shooter_slot = shot.get('event_player_1_slot')
-        shooter_team = shot.get('_shot_team')
-        possession_id = shot.get('possession_id')
-        possession_team = str(shot.get('possession_team') or '').lower()
-        shooter_team_has_possession = (
-            possession_id not in (None, 0)
-            and possession_team == shooter_team
-        )
-        possession_start = possession_starts.get((shot['replay_id'], possession_id))
-        shooter_team_possession_length = (
-            max(shot_seconds - possession_start, 0.0)
-            if shooter_team_has_possession and possession_start is not None
-            else 0.0
-        )
-        shot_stint_id = shot.get('stint_id')
-        stint_events = [
-            event
-            for event in replay_events
-            if event.get('_event_stint_id') == shot_stint_id
-        ]
-        # Stint IDs are the parser-owned kickoff-to-kickoff history boundary.
-        history = [event for event in stint_events if event['frame_number'] < shot_frame]
-        weighted = {event_type: 0.0 for event_type in HISTORY_EVENT_TYPES}
-        kickoff_seconds = next(
-            (
-                event.get('_event_seconds')
-                for event in stint_events
-                if event['event_type'] == 'kickoff'
-                and event.get('_event_seconds') is not None
-            ),
-            None,
-        )
-        for event in history:
-            event_seconds = event.get('_event_seconds')
-            if event_seconds is None or not np.isfinite(event_seconds):
-                continue
-            if event['event_type'] == 'boost_pickup':
-                continue
-            event_end_frame = event.get('_event_end_frame')
-            if event_end_frame is not None and shot_frame <= event_end_frame:
-                weight = 1.0
-            else:
-                decay_start_frame = (
-                    event_end_frame
-                    if event_end_frame is not None and np.isfinite(event_end_frame)
-                    else event.get('frame_number')
-                )
-                weight = 0.5 ** (
-                    max((shot_frame - decay_start_frame) / 30.0, 0.0)
-                    / HISTORY_HALF_LIFE_SECONDS
-                )
-            if event['event_type'] in weighted:
-                weighted[event['event_type']] += weight
-
-        # Offensive context uses short event windows immediately preceding the shot.
-        flags = {column: False for column in OFF_COLUMNS}
-        recent = []
-        for event in reversed(history):
-            event_seconds = event.get('_event_seconds')
-            if event_seconds is None or not np.isfinite(event_seconds):
-                continue
-            delta = shot_seconds - event_seconds
-            if delta > DOUBLE_TAP_SECONDS:
-                break
-            if delta > 0.0:
-                recent.append((event, delta))
-        for event, delta in recent:
-            event_type = event['event_type']
-            same_team = event.get('_event_team') == shooter_team
-            same_shooter = event.get('_event_player_slot') == shooter_slot
-            flags['off_demo'] |= delta <= 2.0 and event_type == 'demo' and same_team
-            flags['off_kickoff'] |= delta <= 5.0 and event_type == 'kickoff'
-            flags['off_challenge_win'] |= delta <= 5.0 and event_type == 'challenge' and same_team
-            flags['off_bump'] |= delta <= 2.0 and event_type == 'bump' and same_team
-            flags['off_pass'] |= delta <= 5.0 and event_type == 'pass' and same_team
-            flags['off_fake'] |= delta <= 5.0 and event_type == 'fake' and same_team
-            flags['off_whiff'] |= delta <= 5.0 and event_type == 'whiff' and not same_team
-            flags['off_air_dribble'] |= delta <= 3.0 and event_type == 'air_dribble' and same_shooter
-            flags['off_ground_dribble'] |= delta <= 3.0 and event_type == 'ground_dribble' and same_shooter
-            flags['off_flick'] |= delta <= 1.0 and event_type == 'flick' and same_shooter
-            flags['off_flip_reset'] |= delta <= 2.0 and event_type == 'flip_reset' and same_shooter
-            if delta <= 2.0 and same_team and event_type in {'entry', 'exit', 'retrieval'}:
-                controlled = (
-                    str(event.get('possession_team', '')).lower() == shooter_team
-                    and not bool(event.get('contested_possession'))
-                )
-                if event_type == 'retrieval':
-                    flags['off_retrieval'] = True
-                elif event_type == 'entry':
-                    flags['off_controlled_entry' if controlled else 'off_uncontrolled_entry'] = True
-                else:
-                    flags['off_controlled_exit' if controlled else 'off_uncontrolled_exit'] = True
-
-        ball_x, ball_y, ball_z = shot.get('ball_pos_x'), shot.get('ball_pos_y'), shot.get('ball_pos_z')
-        shooter_x = shooter_y = shooter_z = None
-        if shooter_slot is not None:
-            shooter_x = shot.get(f'player_{int(shooter_slot)}_pos_x')
-            shooter_y = shot.get(f'player_{int(shooter_slot)}_pos_y')
-            shooter_z = shot.get(f'player_{int(shooter_slot)}_pos_z')
-        flags['off_wall'] = any(
-            value is not None and np.isfinite(value) and distance <= WALL_SHOT_DISTANCE
-            for value, distance in (
-                (ball_x, abs(SIDE_WALL_X - abs(ball_x))) if ball_x is not None else (None, np.inf),
-                (ball_y, abs(BACK_WALL_Y - abs(ball_y))) if ball_y is not None else (None, np.inf),
-                (shooter_x, abs(SIDE_WALL_X - abs(shooter_x))) if shooter_x is not None else (None, np.inf),
-                (shooter_y, abs(BACK_WALL_Y - abs(shooter_y))) if shooter_y is not None else (None, np.inf),
-            )
-        )
-        flags['off_ceiling'] = any(
-            value is not None and np.isfinite(value) and CEILING_Z - value <= CEILING_SHOT_DISTANCE
-            for value in (ball_z, shooter_z)
-        )
-        flags['off_pass'] |= shot.get('_pass_event_id') is not None
-        record = {
-            'replay_id': shot['replay_id'],
-            '_shot_event_id': shot['_shot_event_id'],
-            'history_seconds_since_kickoff': (
-                shot_seconds - kickoff_seconds if kickoff_seconds is not None else None
-            ),
-            'shooter_team_has_possession': shooter_team_has_possession,
-            'shooter_team_possession_length': shooter_team_possession_length,
-            **flags,
-        }
-        record.update({
-            f'history_weighted_{event_type}_count': weighted[event_type]
-            for event_type in HISTORY_EVENT_TYPES
-        })
-        records.append(record)
-    if records:
-        return pl.DataFrame(records)
-    return pl.DataFrame(
-        schema={
-            'replay_id': pl.String,
-            '_shot_event_id': pl.String,
-            'history_seconds_since_kickoff': pl.Float32,
-            'shooter_team_has_possession': pl.Boolean,
-            'shooter_team_possession_length': pl.Float32,
-            **{column: pl.Boolean for column in OFF_COLUMNS},
-            **{
-                f'history_weighted_{event_type}_count': pl.Float32
-                for event_type in HISTORY_EVENT_TYPES
-            },
-        }
-    )
-
-
-def _pass_context_rows(
-    paths: Sequence[Path],
-    selected_replay_ids: Sequence[str] | None,
-) -> pl.LazyFrame:
-    # Pass rows retain their own event identity before nearest-shot linkage.
-    return (
-        _scan_pass_batches(paths, selected_replay_ids)
-        .with_columns([
-            _event_id_expr('pass').alias('_pass_event_id'),
-            pl.col('frame_number').cast(pl.Int64, strict=False).alias('_pass_frame_order'),
-            pl.col('stint_id').cast(pl.Int64, strict=False).alias('_pass_stint_id'),
-        ])
-        .pipe(_explode_event_ids, 'pass', '_pass_event_id')
-        .with_columns(_event_team_expr('_pass_event_id').alias('_pass_team'))
-        .with_columns([
-            *(
-                _slot_expr(field, pl.Float32, '_pass_player_slot')
-                .alias(f'_passer_{field}')
-                for field in PASSER_FIELDS
-            ),
-        ])
-        .filter(pl.col('_pass_event_id').is_not_null())
-        .sort(['replay_id', '_pass_event_id', '_pass_frame_order'])
-        .unique(subset=['replay_id', '_pass_event_id'], keep='last', maintain_order=True)
-        .select([
-            'replay_id', '_pass_event_id', '_pass_team', '_pass_stint_id',
-            '_pass_frame_order',
-            pl.coalesce([
-                pl.col('frame_seconds_elapsed').cast(pl.Float32, strict=False),
-                pl.col('_pass_frame_order').cast(pl.Float32, strict=False) / 30.0,
-            ]).alias('_pass_seconds'),
-            *(
-                pl.col(f'ball_{state}_{axis}').cast(pl.Float32, strict=False)
-                .alias(f'_pass_ball_{state}_{axis}')
-                for state in ('pos', 'vel')
-                for axis in ('x', 'y', 'z')
-            ),
-            *(pl.col(f'_passer_{field}') for field in PASSER_FIELDS),
-        ])
-    )
 
 
 def _goal_labels_from_nearest_shot(
@@ -981,17 +491,15 @@ def _goal_labels_from_nearest_shot(
 def _scan_frame_paths(
     paths: Sequence[Path],
     model_segments: Sequence[str] | str | None,
-    include_event_context: bool = True,
     selected_replay_ids: Sequence[str] | None = None,
 ) -> pl.LazyFrame:
     # Scan a bounded path group into reduced shot-event rows.
     segments = _normalize_segments(model_segments)
     base_frames = (
-        _scan_shot_goal_batches(paths, selected_replay_ids, include_event_context)
+        _scan_shot_goal_batches(paths, selected_replay_ids)
         .with_columns([
             _event_id_expr('shot').alias('_shot_event_id'),
             _event_id_expr('goal').alias('_goal_event_id'),
-            _event_id_expr('pass').alias('_pass_event_id'),
             pl.col('frame_number').cast(pl.Int64, strict=False).alias('_frame_order'),
         ])
         .cache()
@@ -1000,7 +508,7 @@ def _scan_frame_paths(
         _strength_is_allowed_expr()
     )
     goal_frames = _explode_event_ids(base_frames, 'goal', '_goal_event_id')
-    # Modal frame strength owns private replay mode; labels are an explicit fallback.
+    # Prefer replay strength metadata; infer strength from labels when it is absent.
     replay_segments = (
         _scan_replay_mode_batches(paths, selected_replay_ids)
         .with_columns(_strength_team_size_expr().alias('strength_team_size'))
@@ -1022,8 +530,8 @@ def _scan_frame_paths(
         ])
         .with_columns(
             pl.coalesce([
-                pl.col('strength_segment'),
                 pl.col('playlist_segment'),
+                pl.col('strength_segment'),
             ]).alias('model_segment')
         )
         .filter(pl.col('model_segment').is_in(segments))
@@ -1061,61 +569,16 @@ def _scan_frame_paths(
                 '_shot_ordinal',
                 'strength_frame_count',
                 'goal_event_id',
-                'pass_event_id',
                 *(
                     f'{event_type}_event_player_{event_player}_slot'
-                    for event_type in ('shot', 'goal', 'pass')
+                    for event_type in ('shot', 'goal')
                     for event_player in range(1, MAX_PLAYERS + 1)
                 ),
             )
             if column in shots.collect_schema().names()
         ])
     )
-    if not include_event_context:
-        return prepared_shots
-    try:
-        pass_context = _pass_context_rows(paths, selected_replay_ids)
-        prepared_shots = (
-            prepared_shots
-            .drop('_pass_event_id')
-            .sort(['replay_id', '_frame_order'])
-            .join_asof(
-                pass_context.sort(['replay_id', '_pass_frame_order']),
-                left_on='_frame_order',
-                right_on='_pass_frame_order',
-                by_left=['replay_id', '_shot_team', 'stint_id'],
-                by_right=['replay_id', '_pass_team', '_pass_stint_id'],
-                strategy='backward',
-                tolerance=GOAL_LINK_MAX_FRAMES,
-                check_sortedness=False,
-            )
-        )
-    except ValueError as error:
-        if 'No event frame rows matched' not in str(error):
-            raise
-        # No-pass batches still own the typed pass schema required by segment concatenation.
-        prepared_shots = prepared_shots.with_columns([
-            pl.lit(None, dtype=pl.Float32).alias('_pass_seconds'),
-            *(
-                pl.lit(None, dtype=pl.Float32).alias(f'_pass_ball_{state}_{axis}')
-                for state in ('pos', 'vel')
-                for axis in ('x', 'y', 'z')
-            ),
-            *(
-                pl.lit(None, dtype=pl.Float32).alias(f'_passer_{field}')
-                for field in PASSER_FIELDS
-            ),
-        ])
-    shot_rows = prepared_shots.collect(engine='streaming')
-    if shot_rows.is_empty():
-        return shot_rows.lazy()
-    timeline = _scan_timeline_batches(paths, selected_replay_ids)
-    context = _event_context_features(timeline, shot_rows)
-    return shot_rows.join(
-        context,
-        on=['replay_id', '_shot_event_id'],
-        how='left',
-    ).lazy()
+    return prepared_shots
 
 
 def scan_frame_parquets(
@@ -1123,20 +586,23 @@ def scan_frame_parquets(
     model_segments: Sequence[str] | str | None = MODEL_SEGMENTS,
     limit: int | None = None,
     random_state: int = RANDOM_STATE,
-    include_event_context: bool = True,
 ) -> pl.LazyFrame:
     # Lazily expose reduced shot rows from a bounded replay sample.
     paths = _frame_paths(frames_folder)
+
     if limit is not None:
         limit = int(limit)
+
         if limit <= 0:
             raise ValueError('limit must be a positive integer when provided')
+
         if limit < len(paths):
             rng = np.random.default_rng(random_state)
             sample_size = min(len(paths), limit + max(10, limit // 10))
             indices = np.sort(rng.choice(len(paths), size=sample_size, replace=False))
             paths = [paths[index] for index in indices]
-    return _scan_frame_paths(paths, model_segments, include_event_context)
+
+    return _scan_frame_paths(paths, model_segments)
 
 
 def load_training_frames(
@@ -1144,7 +610,6 @@ def load_training_frames(
     model_segments: Sequence[str] | str | None = MODEL_SEGMENTS,
     limit: int | None = None,
     random_state: int = RANDOM_STATE,
-    include_event_context: bool = True,
 ) -> pl.DataFrame:
     # Collect the lazily reduced shot-event training rows as Polars.
     frames = scan_frame_parquets(
@@ -1152,7 +617,6 @@ def load_training_frames(
         model_segments,
         limit,
         random_state,
-        include_event_context,
     ).collect(engine='streaming')
     return limit_replays(frames, limit, random_state)
 
@@ -1165,20 +629,27 @@ def load_training_parquet(
 ) -> pl.DataFrame:
     # Load the compiled, model-ready xG parquet without reopening raw frames.
     path = Path(training_parquet)
+
     if not path.is_file():
         raise FileNotFoundError(f'Compiled xG parquet not found: {path}')
+
     frames = pl.read_parquet(path)
     required = {'replay_id', 'event_id', 'is_goal', 'model_segment'}
     missing = required.difference(frames.columns)
+
     if missing:
         raise ValueError(f'{path}: missing compiled xG columns: {sorted(missing)}')
+
     if segment is not None:
         segment = _normalize_segments((segment,))[0]
         frames = frames.filter(pl.col('model_segment').cast(pl.String, strict=False) == segment)
+
     if frames.is_empty():
         return frames
+
     if frames.select(pl.struct('replay_id', 'event_id').n_unique()).item() != frames.height:
         raise ValueError(f'{path}: duplicate replay/event identities')
+
     return limit_replays(frames, limit, random_state)
 
 
@@ -1187,23 +658,25 @@ def load_segment_training_frames(
     segment: str,
     limit: int | None,
     random_state: int,
-    include_event_context: bool = True,
     frame_paths: Sequence[Path] | None = None,
     selected_replay_ids: Sequence[str] | None = None,
     scan_batch_size: int | None = None,
 ) -> pl.DataFrame:
     # Soft-scan replay files until one segment reaches its replay limit.
     segment = _normalize_segments((segment,))[0]
+
     if frame_paths is not None:
         paths = list(frame_paths)
     else:
         source_root = Path(frames_folder)
         segment_root = source_root / segment
         paths = _frame_paths(segment_root if segment_root.is_dir() else source_root)
+
     rng = np.random.default_rng(random_state)
     # Shuffle only for a soft limit; a full compile keeps deterministic order.
     if limit is not None:
         paths = [paths[index] for index in rng.permutation(len(paths))]
+
     batch_size = (
         max(1, int(scan_batch_size)) if scan_batch_size is not None
             else 512 if limit is None else min(256, max(32, int(limit) * 2))
@@ -1211,34 +684,40 @@ def load_segment_training_frames(
     collected = []
     replay_ids: set[str] = set()
     total_batches = (len(paths) + batch_size - 1) // batch_size
+
     for batch_number, start in enumerate(range(0, len(paths), batch_size), start=1):
         batch_paths = paths[start:start + batch_size]
+
         try:
             batch = _scan_frame_paths(
                 batch_paths,
                 (segment,),
-                include_event_context,
                 selected_replay_ids,
             ).collect(engine='streaming')
         except ValueError as error:
             if 'No event frame rows matched' not in str(error):
                 raise
+
             batch = pl.DataFrame()
+
         if not batch.is_empty():
             # Retain only this segment before opening the next bounded path group.
             collected.append(batch)
             replay_ids.update(batch['replay_id'].drop_nulls().unique().to_list())
+
         target = 'all' if limit is None else str(limit)
         print(
             f'[{segment}] scan {batch_number}/{total_batches}: '
             f'{len(replay_ids)}/{target} replays collected',
             flush=True,
         )
+
         if limit is not None and len(replay_ids) >= int(limit):
             break
+
     if not collected:
         return pl.DataFrame()
-    # Parser versions and pass availability can leave optional columns absent by batch.
+
     frames = pl.concat(collected, how='diagonal_relaxed', rechunk=False)
     return limit_replays(frames, limit, random_state)
 
@@ -1251,12 +730,17 @@ def limit_replays(
     # Select all shot rows from at most ``limit`` randomly chosen replays.
     if limit is None:
         return frames
+
     limit = int(limit)
+
     if limit <= 0:
         raise ValueError('limit must be a positive integer when provided')
+
     replay_ids = frames['replay_id'].drop_nulls().unique().sort().to_numpy()
+
     if limit >= len(replay_ids):
         return frames
+
     rng = np.random.default_rng(random_state)
     selected = rng.choice(replay_ids, size=limit, replace=False)
     return frames.filter(pl.col('replay_id').is_in(selected))
@@ -1265,18 +749,21 @@ def limit_replays(
 def _float_array(frame: pl.DataFrame, column: str, default: float = np.nan) -> np.ndarray:
     if column not in frame.columns:
         return np.full(frame.height, default, dtype=np.float32)
+
     return np.asarray(frame[column].cast(pl.Float32, strict=False).to_numpy(), dtype=np.float32)
 
 
 def _string_array(frame: pl.DataFrame, column: str) -> np.ndarray:
     if column not in frame.columns:
         return np.full(frame.height, '', dtype=str)
+
     return np.asarray(frame[column].cast(pl.String, strict=False).fill_null('').to_numpy(), dtype=str)
 
 
 def _bool_array(frame: pl.DataFrame, column: str) -> np.ndarray:
     if column not in frame.columns:
         return np.zeros(frame.height, dtype=bool)
+
     return np.asarray(frame[column].cast(pl.Boolean, strict=False).fill_null(False).to_numpy(), dtype=bool)
 
 
@@ -1472,6 +959,7 @@ def _project_ball_with_bounces(
 
     for _ in range(32):
         active = remaining > 1e-9
+
         if not np.any(active):
             break
 
@@ -1628,6 +1116,7 @@ def _trajectory_intercept(
         np.where(positive_score, positive_goal_time, negative_goal_time),
     )
     scores_on_path = positive_score | negative_score
+
     for sample in range(1, TRAJECTORY_SAMPLES + 1):
         seconds = horizon * (sample / TRAJECTORY_SAMPLES)
         target_x, target_y, target_z = _ball_at_time(
@@ -1744,6 +1233,7 @@ def _trajectory_intercept(
             required_boost,
             boost_needed_at_intercept,
         )
+
     possible = np.isfinite(intercept_time)
     boost_needed_at_intercept[~possible] = np.nan
     return {
@@ -1923,10 +1413,13 @@ def _selected_player_values(
     slots: np.ndarray,
 ) -> np.ndarray:
     output = np.full(frames.height, np.nan, dtype=np.float32)
+
     for player_number in range(1, MAX_PLAYERS + 1):
         mask = slots == player_number
+
         if np.any(mask):
             output[mask] = _float_array(frames, f'player_{player_number}_{field}')[mask]
+
     return output
 
 
@@ -1936,27 +1429,6 @@ def _player_catalog_features(
     fields: Sequence[str],
 ) -> dict[str, np.ndarray]:
     features = {}
-    for field in fields:
-        if field in PLAYER_BASE_MODEL_FIELDS or field in PLAYER_QUATERNION_FIELDS:
-            continue
-        values = value(field)
-        if field in PLAYER_WORLD_XY_FIELDS:
-            values = values * direction
-        elif field == 'yaw':
-            values = (
-                values
-                + np.where(direction < 0.0, np.pi, 0.0)
-                + np.pi
-            ) % (2.0 * np.pi) - np.pi
-        elif field == 'camera_frame_yaw':
-            values = (
-                values
-                + np.where(direction < 0.0, 32768.0, 0.0)
-                + 32768.0
-            ) % 65536.0 - 32768.0
-        features[PLAYER_FEATURE_ALIASES.get(field, field)] = values
-
-    # Rotate orange quaternions by 180 degrees around world Z with the other geometry.
     rot_x, rot_y, rot_z, rot_w = (
         value(field).copy()
         for field in PLAYER_QUATERNION_FIELDS
@@ -1968,13 +1440,30 @@ def _player_catalog_features(
         'rotation_z': np.where(orange, rot_w, rot_z),
         'rotation_w': np.where(orange, -rot_z, rot_w),
     }
+    euler = quaternion_to_rocket_league_euler(np.column_stack((
+        normalized['rotation_x'], normalized['rotation_y'],
+        normalized['rotation_z'], normalized['rotation_w'],
+    )))
+    euler_values = dict(zip(('pitch', 'yaw', 'roll'), euler.T, strict=True))
+
+    for field in fields:
+        if field in PLAYER_BASE_MODEL_FIELDS or field in PLAYER_QUATERNION_FIELDS:
+            continue
+
+        values = euler_values[field] if field in euler_values else value(field)
+
+        if field in PLAYER_WORLD_XY_FIELDS:
+            values = values * direction
+
+        features[PLAYER_FEATURE_ALIASES.get(field, field)] = values
+
+    # Rotate orange quaternions by 180 degrees around world Z with the other geometry.
     features.update(normalized)
     return features
 
 
 def prepare_model_data(
     frames: pl.DataFrame,
-    include_prior_event_history: bool = False,
 ) -> pl.DataFrame:
     # Engineer attack-normalized ball, shooter, and nearest-defender features.
     shooter_team = np.char.lower(_string_array(frames, 'shooter_team'))
@@ -2094,122 +1583,13 @@ def prepare_model_data(
             shot_end_z,
         ).items()
     })
-    if include_prior_event_history and 'history_seconds_since_kickoff' in frames.columns:
-        data['shooter_team_has_possession'] = _bool_array(frames, 'shooter_team_has_possession')
-        data['shooter_team_possession_length'] = _float_array(
-            frames,
-            'shooter_team_possession_length',
-            0.0,
-        )
-        pass_seconds = _float_array(frames, '_pass_seconds')
-        shot_seconds = _float_array(frames, 'frame_seconds_elapsed')
-        pass_ball_x = _float_array(frames, '_pass_ball_pos_x') * direction
-        pass_ball_y = _float_array(frames, '_pass_ball_pos_y') * direction
-        pass_ball_z = _float_array(frames, '_pass_ball_pos_z')
-        pass_ball_vx = _float_array(frames, '_pass_ball_vel_x') * direction
-        pass_ball_vy = _float_array(frames, '_pass_ball_vel_y') * direction
-        pass_ball_vz = _float_array(frames, '_pass_ball_vel_z')
-        pass_ball_speed = _safe_speed(pass_ball_vx, pass_ball_vy, pass_ball_vz)
-        passer_x = _float_array(frames, '_passer_pos_x') * direction
-        passer_y = _float_array(frames, '_passer_pos_y') * direction
-        passer_z = _float_array(frames, '_passer_pos_z')
-        passer_vx = _float_array(frames, '_passer_vel_x') * direction
-        passer_vy = _float_array(frames, '_passer_vel_y') * direction
-        passer_vz = _float_array(frames, '_passer_vel_z')
-        passer_speed = _safe_speed(passer_vx, passer_vy, passer_vz)
-        passer_ball_distance = _safe_speed(
-            pass_ball_x - passer_x,
-            pass_ball_y - passer_y,
-            pass_ball_z - passer_z,
-        )
-        passer_catalog = _player_catalog_features(
-            lambda field: _float_array(frames, f'_passer_{field}'),
-            direction,
-            PASSER_FIELDS,
-        )
-        passer_spatial = _role_spatial_features(
-            passer_x,
-            passer_y,
-            passer_z,
-            passer_catalog['yaw'],
-            passer_catalog['pitch'],
-            pass_ball_x,
-            pass_ball_y,
-            pass_ball_z,
-            -GOAL_PLANE_Y,
-        )
-        pass_displacement_x = ball_x - pass_ball_x
-        pass_displacement_y = ball_y - pass_ball_y
-        pass_displacement_z = ball_z - pass_ball_z
-        data.update({
-            'pass_seconds_to_shot': np.maximum(shot_seconds - pass_seconds, 0.0),
-            'pass_ball_x': pass_ball_x,
-            'pass_ball_y': pass_ball_y,
-            'pass_ball_z': pass_ball_z,
-            'pass_ball_velocity_x': pass_ball_vx,
-            'pass_ball_velocity_y': pass_ball_vy,
-            'pass_ball_velocity_z': pass_ball_vz,
-            'pass_ball_speed': pass_ball_speed,
-            'pass_ball_displacement_x': pass_displacement_x,
-            'pass_ball_displacement_y': pass_displacement_y,
-            'pass_ball_displacement_z': pass_displacement_z,
-            'pass_ball_distance': _safe_speed(
-                pass_displacement_x,
-                pass_displacement_y,
-                pass_displacement_z,
-            ),
-            'pass_ball_velocity_change_x': ball_vx - pass_ball_vx,
-            'pass_ball_velocity_change_y': ball_vy - pass_ball_vy,
-            'pass_ball_velocity_change_z': ball_vz - pass_ball_vz,
-            'pass_ball_speed_change': ball_speed - pass_ball_speed,
-            'passer_on_field': _bool_array(frames, '_passer_on_field'),
-            'passer_x': passer_x,
-            'passer_y': passer_y,
-            'passer_z': passer_z,
-            'passer_velocity_x': passer_vx,
-            'passer_velocity_y': passer_vy,
-            'passer_velocity_z': passer_vz,
-            'passer_speed': passer_speed,
-            'passer_boost': _float_array(frames, '_passer_boost_raw'),
-            'passer_ball_relative_x': pass_ball_x - passer_x,
-            'passer_ball_relative_y': pass_ball_y - passer_y,
-            'passer_ball_relative_z': pass_ball_z - passer_z,
-            'passer_time_to_ball': _safe_divide(
-                passer_ball_distance,
-                np.maximum(passer_speed, 500.0),
-            ),
-        })
-        data.update({f'passer_{field}': values for field, values in passer_catalog.items()})
-        data.update({f'passer_{field}': values for field, values in passer_spatial.items()})
-        data.update({
-            f'passer_{field}': values
-            for field, values in _contact_features(
-                passer_x,
-                passer_y,
-                passer_z,
-                passer_catalog['yaw'],
-                passer_catalog['pitch'],
-                pass_ball_x,
-                pass_ball_y,
-                pass_ball_z,
-                ball_x,
-                ball_y,
-                ball_z,
-            ).items()
-        })
-        for column in OFF_COLUMNS:
-            data[column] = _bool_array(frames, column)
-        data['history_seconds_since_kickoff'] = _float_array(frames, 'history_seconds_since_kickoff')
-        for event_type in HISTORY_EVENT_TYPES:
-            column = f'history_weighted_{event_type}_count'
-            data[column] = _float_array(frames, column, 0.0)
-
     # Distance ordering gives defenders stable feature slots across every game mode.
     defender_distances = np.full(
         (frames.height, MAX_PLAYERS),
         np.inf,
         dtype=np.float32,
     )
+
     for player_number in range(1, MAX_PLAYERS + 1):
         team = np.char.lower(_string_array(frames, f'player_{player_number}_team'))
         on_field = _float_array(frames, f'player_{player_number}_on_field', 0) != 0
@@ -2305,6 +1685,7 @@ def prepare_model_data(
                 shot_path_valid,
             ).items()
         })
+
     return pl.DataFrame(data)
 
 
@@ -2315,6 +1696,7 @@ def to_sparse_matrix(
     # Build CSR one feature at a time without a full dense intermediate.
     # Column-wise construction avoids materializing the full rows-by-features array.
     columns = []
+
     for column in feature_columns:
         values = np.array(
             features[column].cast(pl.Float32, strict=False).to_numpy(),
@@ -2323,8 +1705,10 @@ def to_sparse_matrix(
         )
         values[~np.isfinite(values)] = np.nan
         columns.append(sparse.csr_matrix(values.reshape(-1, 1)))
+
     if not columns:
         return sparse.csr_matrix((features.height, 0), dtype=np.float32)
+
     matrix = sparse.hstack(columns, format='csr', dtype=np.float32)
     del columns
     return matrix
@@ -2336,7 +1720,9 @@ def _feature_matrix(
 ) -> np.ndarray:
     if features.height == 0:
         return np.empty((0, len(feature_columns)), dtype=np.float32)
+
     columns = []
+
     for column in feature_columns:
         values = np.array(
             features[column].cast(pl.Float32, strict=False).to_numpy(),
@@ -2345,6 +1731,7 @@ def _feature_matrix(
         )
         values[~np.isfinite(values)] = np.nan
         columns.append(values)
+
     return np.column_stack(columns).astype(np.float32, copy=False)
 
 
@@ -2367,33 +1754,32 @@ def _variable_feature_columns(
         if int(class_counts.get(column) or 0) > 1
     ]
     removed = [column for column in feature_columns if column not in selected]
+
     if not selected:
         raise ValueError('Training data does not contain any variable model features')
+
     return selected, removed
 
 
 def _feature_column_class(column: str) -> str:
     if column.startswith('shooter_'):
         return 'shooter'
-    if column.startswith('passer_'):
-        return 'passer'
+
     if column.startswith('defender_'):
         return 'defender'
-    if column.startswith('pass_'):
-        return 'pass'
+
     if column.startswith('ball_'):
         return 'ball'
-    if column.startswith('off_'):
-        return 'offensive_context'
-    if column.startswith('history_'):
-        return 'history'
+
     return 'context'
 
 
 def _feature_column_classes(feature_columns: Sequence[str]) -> dict[str, list[str]]:
     classes: dict[str, list[str]] = {}
+
     for column in feature_columns:
         classes.setdefault(_feature_column_class(column), []).append(column)
+
     return classes
 
 

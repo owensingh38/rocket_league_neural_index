@@ -8,12 +8,11 @@ OPEN_HORIZON_BUCKET_SECONDS = DEFAULT_HORIZON_MAX
 def _horizon_steps(horizon_max):
     if not math.isfinite(horizon_max) or horizon_max < 1:
         raise ValueError("horizon_max must be finite and at least one second")
-    return int(math.floor(horizon_max))
 
+    return int(math.floor(horizon_max))
 
 def open_horizon(horizon_seconds):
     return horizon_seconds is None or horizon_seconds == 0
-
 
 def build_frame_batch(frame, indices, tokenizer, *, targets_per_team=1, geometric_width=1.0,
                       horizon_seconds=10.0,
@@ -30,10 +29,11 @@ def build_frame_batch(frame, indices, tokenizer, *, targets_per_team=1, geometri
         horizon_seconds=horizon_seconds, horizon_max=horizon_max,
         two_way_prediction=two_way_prediction,
     )
+
     if two_way_prediction:
         # NumPy treats a CPU torch.bool tensor as integer indices via its
-        # __array__ protocol (e.g. [True] becomes index [1]). Convert the
-        # mask to a NumPy bool array before indexing NumPy inputs, then back
+        # __array__ protocol (e.g. [True] becomes index [1]). 
+        # Convert the mask to a NumPy bool array before indexing NumPy inputs, then back
         # to a torch mask for the target tensors.
         valid = (collapsed >= 0).numpy()
         valid_tensor = torch.from_numpy(valid)
@@ -43,11 +43,14 @@ def build_frame_batch(frame, indices, tokenizer, *, targets_per_team=1, geometri
         orange_goal_next = orange_goal_next[valid]
         temporal = temporal[valid_tensor]
         collapsed = collapsed[valid_tensor]
+
         if not indices.size:
             return None
-    result = tokenizer(frame[indices.tolist()])
+
+    result = tokenizer(frame[indices])
     result["temporal_targets"] = temporal
     result["collapsed_targets"] = collapsed
+
     if open_horizon(horizon_seconds):
         goal_teams = np.where(blue_goal_next, 0, np.where(orange_goal_next, 1, 2))
         horizons = np.arange(1, _horizon_steps(horizon_max) + 1, dtype=np.float64)[None, :]
@@ -62,14 +65,17 @@ def build_frame_batch(frame, indices, tokenizer, *, targets_per_team=1, geometri
             goal_teams[:, None], horizon_labels.shape
         )[occurs_by_horizon]
         result["horizon_targets"] = torch.from_numpy(horizon_labels)
+
     return result
 
 
 def output_count(targets_per_team, horizon_seconds=10.0, two_way_prediction=False):
     if targets_per_team < 1:
         raise ValueError("targets_per_team must be at least one")
+
     if not open_horizon(horizon_seconds) and (not math.isfinite(horizon_seconds) or horizon_seconds < 0):
         raise ValueError("horizon_seconds must be non-negative and finite, or None")
+
     return 2 * int(targets_per_team) + int(not two_way_prediction)
 
 
@@ -80,11 +86,14 @@ def bucket_edges(targets_per_team=1, geometric_width=1.0, horizon_seconds=10.0,
             or (not open_horizon(horizon_seconds)
                 and (not math.isfinite(horizon_seconds) or horizon_seconds < 0))):
         raise ValueError("targets_per_team and horizon_max must be positive; geometric_width must be finite and positive")
+
     finite_buckets = targets_per_team - int(open_horizon(horizon_seconds))
     edges = np.empty(finite_buckets + 1, dtype=np.float64)
     edges[0] = 0.0
+
     if finite_buckets == 0:
         return edges
+
     raw = np.power(float(geometric_width), np.arange(finite_buckets, dtype=np.float64))
     duration = float(horizon_max) if open_horizon(horizon_seconds) else float(horizon_seconds)
     edges[1:] = np.cumsum(raw / raw.sum() * duration)
@@ -109,8 +118,10 @@ def temporal_targets(
 
     blue = np.asarray(blue_goal_next, dtype=bool)
     orange = np.asarray(orange_goal_next, dtype=bool)
+
     if dt.shape != blue.shape or dt.shape != orange.shape or np.any(blue & orange):
         raise ValueError("blue_goal_next and orange_goal_next must align and cannot both be true")
+
     if np.any((blue | orange) & ~np.isfinite(dt)):
         raise ValueError("a scoring stint must have a finite time_until_next_goal")
 
@@ -120,10 +131,18 @@ def temporal_targets(
     values = np.zeros((dt.size, output_count(
         targets_per_team, horizon_seconds, two_way_prediction,
     )), dtype=np.float32)
+
     if not two_way_prediction:
         values[:, -1] = 1.0
+
     qualifies_by_time = (np.isfinite(dt) & (dt > 0.0)
                          & ((dt <= horizon_seconds) if not unbounded else True))
+
+    if two_way_prediction:
+        # Two-way outputs have no neither class, so retain every eventual
+        # scoring event and represent beyond-horizon mass in the final bucket.
+        qualifies_by_time = np.isfinite(dt) & (dt > 0.0)
+
     qualifying = qualifies_by_time & np.isin(teams, (0, 1))
     collapsed = np.where(qualifying, teams, -1 if two_way_prediction else 2).astype(np.int64)
     rows = np.flatnonzero(qualifying)
@@ -145,37 +164,43 @@ def temporal_targets(
             selected = teams[rows] == team
             start = team * team_width
             team_mass = mass[selected].copy()
+
             if unbounded and finite_buckets:
                 team_mass[:, 0] += left_tail[selected]
+
             valid_values[selected, start:start + finite_buckets] = team_mass
 
         tail = (np.clip(1.0 - cdf[:, -1].numpy(), 0.0, 1.0).astype(np.float32)
                 if unbounded
                 else np.clip(1.0 - mass.sum(axis=1), 0.0, 1.0))
+
         if unbounded:
             if finite_buckets == 0:
                 # One open-horizon bucket represents the whole scoring stint.
                 tail.fill(1.0)
+
             long_bucket = targets_per_team - 1
+
             for team in (0, 1):
                 selected = teams[rows] == team
                 valid_values[selected, team * targets_per_team + long_bucket] = tail[selected]
         elif not two_way_prediction:
             valid_values[:, -1] = tail
         else:
-            totals = valid_values.sum(axis=1, keepdims=True)
-            valid_values = np.divide(
-                valid_values, totals, out=np.zeros_like(valid_values),
-                where=totals > 0.0,
-            )
+            # For a finite horizon, the last team bucket also carries the
+            # overflow tail. This avoids dropping scoring examples whose goal
+            # occurs after the final explicit time edge.
+            valid_values[:, targets_per_team - 1] += tail
 
         values[rows] = valid_values
 
     targets = torch.from_numpy(values)
 
     expected_sums = torch.ones(dt.size)
+
     if two_way_prediction:
         expected_sums = torch.from_numpy(qualifying.astype(np.float32))
+
     if not torch.allclose(targets.sum(dim=-1), expected_sums, atol=1e-5):
         raise RuntimeError("temporal targets must sum to one")
 
@@ -185,15 +210,19 @@ def temporal_targets(
 def collapse_probabilities(probabilities, targets_per_team, horizon_seconds=10.0,
                            two_way_prediction=False):
     full_count = output_count(targets_per_team, horizon_seconds, two_way_prediction)
+
     if probabilities.shape[-1] != full_count:
         raise ValueError("probability width does not match targets_per_team")
+
     team_width = targets_per_team
     teams = (
         probabilities[..., :team_width].sum(dim=-1),
         probabilities[..., team_width:2 * team_width].sum(dim=-1),
     )
+
     if two_way_prediction:
         neither = probabilities.new_zeros(probabilities.shape[:-1])
     else:
         neither = probabilities[..., -1]
+
     return torch.stack((*teams, neither), dim=-1)

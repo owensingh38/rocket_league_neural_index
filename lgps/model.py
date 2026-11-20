@@ -2,19 +2,20 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from props import BALL_FEATURES, BLUE_GOAL, CONTEXT_FEATURES, GOAL_FEATURES, ORANGE_GOAL, PLAYER_FEATURES, normalize_model_entities
-from .camera import PlayerCameraViewEncoder
+from shared import BALL_FEATURES, BLUE_GOAL, CONTEXT_FEATURES, GOAL_FEATURES, ORANGE_GOAL, PLAYER_FEATURES, normalize_model_entities
 from .config import LGPSModelConfig
 from .dataset import LGPSEntityTokenizer, LGPSScaler
+from .aux_tasks import (
+    LGPSBallStateAux, LGPSNextTouchAux, configured_aux_tasks,
+)
 
 torch.set_float32_matmul_precision("high")
-
 
 def _stack_entities(values):
     if isinstance(values, torch.Tensor):
         return values
-    return torch.stack(values, dim=1)
 
+    return torch.stack(values, dim=1)
 
 class LGPSAgent(nn.Module):
     def __init__(self, input_dim, d_model, *, missing_aware=False):
@@ -41,6 +42,7 @@ class LGPSAgent(nn.Module):
                 ),
                 dim=-1,
             )
+
         return self.network(x)
 
 
@@ -218,11 +220,13 @@ class RelationalGeometry(PairwiseGeometry):
         valid = torch.cat((torch.ones(batch, 1, device=ball.device, dtype=torch.bool),
                            live, torch.ones(batch, 2, device=ball.device, dtype=torch.bool)), 1)
         geometry[:, :9, :9, :BASE_GEOMETRY_WIDTH] *= (valid[:, :, None] & valid[:, None, :])[..., None]
+
         if not self.expanded_geometry:
             pad_geometry = core.new_zeros(batch, entity_count, entity_count, 3)
             allowed = torch.zeros(batch, entity_count, entity_count, device=ball.device, dtype=torch.bool)
             allowed[:, :9, :9] = True
             pad_edges = torch.zeros_like(allowed)
+
             if self.include_boosts:
                 pad_delta = boosts[:, None, :, :2] - pos[:, 1:7, None, :2]
                 pad_position = torch.cat((pad_delta / 5000.0,
@@ -233,7 +237,9 @@ class RelationalGeometry(PairwiseGeometry):
                 allowed[:, 9:, 1:7] = live[:, None, :]
                 pad_edges[:, 1:7, 9:] = live[:, :, None]
                 pad_edges[:, 9:, 1:7] = live[:, None, :]
+
             return geometry, pad_geometry, allowed, pad_edges
+
         q = torch.nan_to_num(players[..., 9:13])
         q = F.normalize(q, dim=-1)
         x, y, z, w = q.unbind(-1)
@@ -267,19 +273,23 @@ class RelationalGeometry(PairwiseGeometry):
         masks[:, 4, :, 1:7] = ~same & (teams[:, :, None] < 2) & (teams[:, None, :] < 2)
         masks = masks & live[:, None, :, None] & valid[:, None, None, :]
         distance = delta[..., 1:7, :].norm(dim=-1)
+
         for group, base in ((5, 3), (6, 4)):
             candidates = masks[:, base, :, 1:7]
             distances = distance.masked_fill(~candidates, float("inf"))
             minimum = distances.amin(-1, keepdim=True)
             # Include tied nearest players to preserve permutation equivariance.
             masks[:, group, :, 1:7] = candidates & (distances == minimum)
+
         for group in range(len(RELATION_NAMES)):
             start = BASE_GEOMETRY_WIDTH + group * len(RELATION_FEATURES)
             geometry[:, 1:7, :9, start:start+len(RELATION_FEATURES)] = torch.where(
                 masks[:, group, :, :, None], relation, 0.0)
+
         ball_delta = pos[:, 1:7] - pos[:, :1]
         ball_rel = torch.cat((ball_delta.norm(dim=-1, keepdim=True)/6000.0,
                               angles(ball_delta)), -1)
+
         for team in (0, 1):
             candidates = live & (teams == team)
             distances = ball_delta.norm(dim=-1).masked_fill(~candidates, float("inf"))
@@ -292,6 +302,7 @@ class RelationalGeometry(PairwiseGeometry):
         allowed = torch.zeros(batch, entity_count, entity_count, device=ball.device, dtype=torch.bool)
         allowed[:, :9, :9] = True
         pad_edges = torch.zeros_like(allowed)
+
         if self.include_boosts:
             pad_delta = boosts[:, None, :, :2] - pos[:, 1:7, None, :2]
             pad_position = torch.cat((pad_delta / 5000.0,
@@ -302,15 +313,17 @@ class RelationalGeometry(PairwiseGeometry):
             allowed[:, 9:, 1:7] = live[:, None, :]
             pad_edges[:, 1:7, 9:] = live[:, :, None]
             pad_edges[:, 9:, 1:7] = live[:, None, :]
+
         return geometry, pad_geometry, allowed, pad_edges
 
 class LGPSAttention(nn.Module):
     def __init__(self, d_model, num_heads, expanded_geometry, pairwise_rank, dropout,
-                 include_boosts=True, attention_mode="standard"):
+                 include_boosts=True, attention_mode="standard", *, pairwise_fp32=False):
         super().__init__()
 
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
+
         if pairwise_rank <= 0:
             raise ValueError("pairwise_rank must be positive")
 
@@ -319,7 +332,14 @@ class LGPSAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self.pairwise_rank = pairwise_rank
         self.attention_mode = attention_mode
+        self.pairwise_fp32 = pairwise_fp32
         self.onnx_export = False
+        self.capture_attention = False
+        self.last_attention = None
+        self.capture_bias = False
+        self.last_bias = None
+        self.last_geometry_bias = None
+        self.last_pairwise_bias = None
 
         self.q = nn.Linear(d_model, d_model)
         self.k = nn.Linear(d_model, d_model)
@@ -327,7 +347,7 @@ class LGPSAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model)
 
         if attention_mode == "relational":
-            # Optional relation and state biases reproduce the legacy attention.
+            # Optional relation and state biases define relational attention.
             self.geometry_bias = nn.Sequential(
                 nn.Linear(geometry_width(expanded_geometry), d_model),
                 nn.GELU(),
@@ -347,6 +367,7 @@ class LGPSAttention(nn.Module):
                 nn.Sequential(nn.Linear(3, d_model), nn.GELU(), nn.Linear(d_model, num_heads))
                 if include_boosts else None
             )
+
             if self.pad_geometry_bias is not None:
                 nn.init.zeros_(self.pad_geometry_bias[-1].weight)
                 nn.init.zeros_(self.pad_geometry_bias[-1].bias)
@@ -358,6 +379,7 @@ class LGPSAttention(nn.Module):
             self.pairwise_target_role = None
             self.register_parameter("pairwise_scale", None)
             self.pad_geometry_bias = None
+
         self.dropout = nn.Dropout(dropout)
 
     def pairwise_state_features(
@@ -367,7 +389,24 @@ class LGPSAttention(nn.Module):
         entity_team_features,
         entity_role_features,
     ):
-        # Keep this path in the active AMP dtype. The previous FP32 casts
+        features = entity_type_features, entity_team_features, entity_role_features
+        device_type = streams.device.type
+        if (self.pairwise_fp32 and torch.is_autocast_enabled(device_type)
+                and torch.get_autocast_dtype(device_type) == torch.float16):
+            # The unscaled dot product can overflow in FP16 even when the
+            # final bias fits. Its infinity poisons the scale's backward pass.
+            with torch.autocast(device_type=device_type, enabled=False):
+                return self._pairwise_state_features(streams.float(), *features)
+        return self._pairwise_state_features(streams, *features)
+
+    def _pairwise_state_features(
+        self,
+        streams,
+        entity_type_features,
+        entity_team_features,
+        entity_role_features,
+    ):
+        # The previous FP32 casts
         # duplicated large pairwise tensors and defeated mixed precision.
         # Pairwise logits must remain defined even when a partially observed
         # entity carries NaN/Inf fields. Entity encoders expose missingness in
@@ -421,17 +460,19 @@ class LGPSAttention(nn.Module):
         #         recomputing it on every loop while avoiding the dominant repeated MLP.
         #
         geometry = torch.nan_to_num(geometry, nan=0.0, posinf=0.0, neginf=0.0)
-        pad_geometry = torch.nan_to_num(pad_geometry, nan=0.0, posinf=0.0, neginf=0.0)
         batch_size, entity_count = geometry.shape[:2]
         core_bias = self.geometry_bias(geometry[:, :core_count, :core_count])
         edge_bias = core_bias.new_zeros(batch_size, entity_count, entity_count, self.num_heads)
         edge_bias[:, :core_count, :core_count] = core_bias
+
         if entity_count > core_count:
             assert self.pad_geometry_bias is not None
+            pad_geometry = torch.nan_to_num(pad_geometry, nan=0.0, posinf=0.0, neginf=0.0)
             edge_bias[:, :core_count, core_count:] = self.pad_geometry_bias(
                 pad_geometry[:, :core_count, core_count:])
             edge_bias[:, core_count:, :core_count] = self.pad_geometry_bias(
                 pad_geometry[:, core_count:, :core_count])
+
         return edge_bias
 
     def forward(
@@ -442,6 +483,7 @@ class LGPSAttention(nn.Module):
         entity_team_features,
         entity_role_features,
         pad_geometry, allowed, pad_edges, core_count, static_geometry_bias=None,
+        *, mask_standard=False,
     ):
         streams = torch.nan_to_num(streams, nan=0.0, posinf=0.0, neginf=0.0)
         batch_size, entity_count = streams.shape[:2]
@@ -472,20 +514,48 @@ class LGPSAttention(nn.Module):
                 entity_role_features[:, :core_count],
             )
             geometry_bias = static_geometry_bias
+
             if geometry_bias is None:
                 geometry_bias = self.static_geometry_bias(geometry, pad_geometry, core_count)
+
             if entity_count == core_count:
                 edge_bias = geometry_bias + pairwise_features
+                state_bias = pairwise_features
             else:
                 state_bias = geometry_bias.new_zeros(batch_size, entity_count, entity_count, self.num_heads)
                 state_bias[:, :core_count, :core_count] = pairwise_features
                 edge_bias = geometry_bias + state_bias
+
+            self.last_bias = edge_bias.detach() if self.capture_bias else None
+            self.last_geometry_bias = geometry_bias.detach() if self.capture_bias else None
+            self.last_pairwise_bias = state_bias.detach() if self.capture_bias else None
             bias = edge_bias.permute(0, 3, 1, 2).to(queries.dtype)
             bias = bias.masked_fill(~allowed[:, None], float("-inf"))
         else:
             # Standard all-token self-attention: no physical or learned
             # pairwise additive bias and no relation-derived edge mask.
-            bias = None
+            bias = allowed[:, None] if mask_standard else None
+            self.last_bias = None
+            self.last_geometry_bias = None
+            self.last_pairwise_bias = None
+
+        allowed_rows = allowed.any(-1, keepdim=True)
+        if self.capture_attention:
+            # Diagnostic path used by lgps.visualize. Keep the normal
+            # fused attention path unchanged unless explicitly enabled.
+            scores = torch.matmul(queries, keys.transpose(-2, -1)) * (self.head_dim ** -0.5)
+
+            if bias is not None:
+                if bias.dtype == torch.bool:
+                    scores = scores.masked_fill(~bias, float("-inf"))
+                else:
+                    scores = scores + bias
+
+            scores = scores.masked_fill(~allowed_rows[:, None], 0)
+            self.last_attention = (scores.softmax(dim=-1) * allowed_rows[:, None]).detach()
+        else:
+            self.last_attention = None
+
         attended = F.scaled_dot_product_attention(
             queries,
             keys,
@@ -504,12 +574,13 @@ class LGPSAttention(nn.Module):
             flattened = torch.cat(tuple(attended[:, head] for head in range(self.num_heads)), dim=-1)
         else:
             flattened = attended.transpose(1, 2).reshape(batch_size, entity_count, self.d_model)
+
         output = self.out(flattened)
-        return output * allowed.any(-1, keepdim=True)
+        return output * allowed_rows
 
 
 class LGPSTransformerBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, *, pairwise_fp32=False):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(config.d_model)
@@ -521,6 +592,7 @@ class LGPSTransformerBlock(nn.Module):
             config.dropout,
             include_boosts=("big_boosts" in config.model_entities or "small_boosts" in config.model_entities),
             attention_mode=config.attention_mode,
+            pairwise_fp32=pairwise_fp32,
         )
         self.norm2 = nn.LayerNorm(config.d_model)
         self.ffn = nn.Sequential(
@@ -539,6 +611,7 @@ class LGPSTransformerBlock(nn.Module):
         entity_team_features,
         entity_role_features,
         pad_geometry, allowed, pad_edges, core_count, static_geometry_bias=None,
+        *, mask_standard=False,
     ):
         normalized = self.norm1(streams)
         updates = self.attention(
@@ -547,7 +620,7 @@ class LGPSTransformerBlock(nn.Module):
             entity_type_features,
             entity_team_features,
             entity_role_features,
-            pad_geometry, allowed, pad_edges, core_count, static_geometry_bias,
+            pad_geometry, allowed, pad_edges, core_count, static_geometry_bias, mask_standard=mask_standard,
         )
         streams = streams + updates
         return streams + self.ffn(self.norm2(streams))
@@ -596,8 +669,7 @@ class LearnedQueryPooling(nn.Module):
 
 
 class LGPSTransformer(nn.Module):
-    def __init__(self, config: LGPSModelConfig = LGPSModelConfig(),
-                 player_view=False, camera_encoder_settings=None):
+    def __init__(self, config: LGPSModelConfig = LGPSModelConfig(), aux_tasks=None):
         super().__init__()
         self.config = config
         self.model_entities = normalize_model_entities(config.model_entities)
@@ -632,24 +704,16 @@ class LGPSTransformer(nn.Module):
             LGPSAgent(len(PLAYER_FEATURES), config.d_model, missing_aware=True)
             if "players" in self.model_entities else None
         )
-        self.player_view = bool(player_view)
-        if self.player_view and self.player_stream is None:
-            raise ValueError('player_view requires players in model_entities')
-        self.player_camera_view = (
-            PlayerCameraViewEncoder(config.d_model, camera_encoder_settings,
-                                    model_entities=self.model_entities)
-            if self.player_view else None
-        )
         self.goal_stream = (
             LGPSAgent(len(GOAL_FEATURES), config.d_model)
             if "goals" in self.model_entities else None
         )
         self.big_boost_stream = (
-            LGPSAgent(6, config.d_model)
+            LGPSAgent(7, config.d_model)
             if "big_boosts" in self.model_entities else None
         )
         self.small_boost_stream = (
-            LGPSAgent(6, config.d_model)
+            LGPSAgent(7, config.d_model)
             if "small_boosts" in self.model_entities else None
         )
         # Context is encoded separately and is never inserted into the entity axis.
@@ -714,55 +778,82 @@ class LGPSTransformer(nn.Module):
                 config.num_outputs,
             ),
         )
+        aux_settings = configured_aux_tasks(aux_tasks)
+        self.aux_task_settings = aux_settings
+        self.aux_tasks = frozenset(aux_settings)
 
-    def encode_streams(self, ball, players, goals, big_boosts, small_boosts, entity_types, entity_teams,
-                       camera_features=None, camera_visible=None, camera_valid=None,
-                       camera_age=None, camera_relation=None):
+        if self.aux_tasks and "players" not in self.model_entities:
+            raise ValueError('LGPS auxiliary tasks require players in model_entities')
+
+        self.ball_state_aux = (
+            aux_settings[LGPSBallStateAux].build(config.d_model)
+            if LGPSBallStateAux in aux_settings else LGPSBallStateAux(config.d_model, ())
+        )
+        self.next_touch_aux = (
+            aux_settings[LGPSNextTouchAux].build(config.d_model)
+            if LGPSNextTouchAux in aux_settings else LGPSNextTouchAux(config.d_model)
+        )
+
+        for task, head in ((LGPSBallStateAux, self.ball_state_aux),
+                           (LGPSNextTouchAux, self.next_touch_aux)):
+            if task not in self.aux_tasks:
+                head.requires_grad_(False)
+
+        self.player_entity_positions = torch.tensor(
+            [index for index, entity in enumerate(self.entity_indices.tolist()) if 1 <= entity <= 6],
+            dtype=torch.long,
+        )
+
+    def encode_streams(self, ball, players, goals, big_boosts, small_boosts, entity_types, entity_teams):
         streams = []
+
         if "ball" in self.model_entities:
             streams.append(self.ball_stream(ball.float() / self.ball_scale).unsqueeze(1))
+
         if "players" in self.model_entities:
             player_embedding = self.player_stream(players.float() / self.player_scale)
-            if self.player_view:
-                if any(value is None for value in (camera_features, camera_visible, camera_valid,
-                                                    camera_age, camera_relation)):
-                    raise ValueError('player_view requires camera history inputs')
-                player_embedding = self.player_camera_view(
-                    player_embedding, camera_features.float(), camera_visible,
-                    camera_valid, camera_age, camera_relation,
-                )
             streams.append(player_embedding)
+
         if "goals" in self.model_entities:
             streams.append(self.goal_stream(goals.float() / self.goal_scale))
+
         if "big_boosts" in self.model_entities:
             if big_boosts is None:
                 raise ValueError("big_boosts must be supplied when selected")
+
             streams.append(self.big_boost_stream(
-                big_boosts / big_boosts.new_tensor([5000., 5000., 1., 1., 1., 10.])))
+                big_boosts / big_boosts.new_tensor([5000., 5000., 5000., 1., 1., 1., 10.])))
+
         if "small_boosts" in self.model_entities:
             if small_boosts is None:
                 raise ValueError("small_boosts must be supplied when selected")
+
             streams.append(self.small_boost_stream(
-                small_boosts / small_boosts.new_tensor([5000., 5000., 1., 1., 1., 5.])))
+                small_boosts / small_boosts.new_tensor([5000., 5000., 5000., 1., 1., 1., 4.])))
+
         streams = torch.cat(streams, dim=1)
         return streams + self.type_embedding(entity_types)[None] + self.team_embedding(entity_teams)
 
     def forward(self, ball, players, goals, entity_types, entity_teams, game_context,
-                big_boosts=None, small_boosts=None,
-                camera_features=None, camera_visible=None, camera_valid=None,
-                camera_age=None, camera_relation=None):
+                big_boosts=None, small_boosts=None, return_aux=False):
         if entity_types.ndim == 2:
             entity_types = entity_types[0]
+
         if entity_types.numel() != len(self.entity_indices):
             raise ValueError("entity_types must match model_entities")
-        if "big_boosts" in self.model_entities and (big_boosts is None or big_boosts.shape[-2:] != (6, 6)):
-            raise ValueError("big_boosts must have shape (..., 6, 6) when selected")
-        if "small_boosts" in self.model_entities and (small_boosts is None or small_boosts.shape[-2:] != (28, 6)):
-            raise ValueError("small_boosts must have shape (..., 28, 6) when selected")
+
+        if "big_boosts" in self.model_entities and (big_boosts is None or big_boosts.shape[-2:] != (6, 7)):
+            raise ValueError("big_boosts must have shape (..., 6, 7) when selected")
+
+        if "small_boosts" in self.model_entities and (small_boosts is None or small_boosts.shape[-2:] != (28, 7)):
+            raise ValueError("small_boosts must have shape (..., 28, 7) when selected")
+
         if ball.ndim != 2:
             raise ValueError("LGPS accepts one current frame per example; temporal input sequences are not supported")
+
         batch = ball.shape[0]
         entity_count = len(self.entity_indices)
+
         if entity_teams.ndim == 1:
             entity_teams = entity_teams.view(1, entity_count).expand(batch, -1)
         elif entity_teams.ndim == 2:
@@ -770,12 +861,13 @@ class LGPSTransformer(nn.Module):
                 raise ValueError("entity_teams must describe every configured entity in each frame")
         else:
             raise ValueError("entity_teams must have shape (entities,) or (batch, entities)")
+
         current = self.encode_streams(
             ball, players, goals, big_boosts, small_boosts, entity_types, entity_teams,
-            camera_features, camera_visible, camera_valid, camera_age, camera_relation,
         )
         current_boosts = None if big_boosts is None and small_boosts is None else torch.cat(
             tuple(value for value in (big_boosts, small_boosts) if value is not None), dim=1)
+
         if self.config.attention_mode == "relational":
             with torch.autocast(device_type=ball.device.type, enabled=False):
                 full_teams = entity_teams.new_full((batch, 43), 2)
@@ -783,6 +875,7 @@ class LGPSTransformer(nn.Module):
                 full_geometry, full_pad_geometry, full_allowed, full_pad_edges = self.geometry(
                     ball.float(), players.float(), goals.float(),
                     current_boosts.float() if current_boosts is not None else None, full_teams)
+
             selected = self.geometry_indices
             geometry = full_geometry.index_select(1, selected).index_select(2, selected)
             pad_geometry = full_pad_geometry.index_select(1, selected).index_select(2, selected)
@@ -795,108 +888,86 @@ class LGPSTransformer(nn.Module):
             allowed = torch.ones(
                 batch, entity_count, entity_count, device=ball.device, dtype=torch.bool
             )
+
         types = F.one_hot(entity_types, num_classes=4).float().expand(batch, -1, -1)
         teams = F.one_hot(entity_teams, num_classes=3).float()
         role_ids = torch.where(entity_types == 0, 0, torch.where(entity_types == 1, 1 + entity_teams,
                    torch.where(entity_types == 2, 3 + entity_teams, 5)))
         roles = F.one_hot(role_ids, num_classes=6).float()
         loop_index = 0
+
         for block in self.blocks:
             static_geometry_bias = (
                 block.attention.static_geometry_bias(geometry, pad_geometry, self.core_count)
                 if self.config.attention_mode == "relational" else None
             )
+
             for _ in range(self.loops_per_block):
                 state = current + self.loop_embeddings[loop_index].view(1, 1, -1)
                 current = block(state, geometry, types, teams, roles, pad_geometry, allowed, pad_edges,
                                 self.core_count, static_geometry_bias)
                 loop_index += 1
+
         shared = current[:, :self.core_count]
         pooled = self.pool(shared)
         context = (self.context_token(game_context.float() / self.context_scale) if "context" in self.model_entities
                    else current.new_zeros(batch, self.config.d_model))
         logits = self.head(torch.cat((pooled, context), dim=-1))
+
+        if return_aux and self.aux_tasks:
+            positions = self.player_entity_positions.to(shared.device)
+            player_streams = shared.index_select(1, positions)
+            auxiliary_context = pooled + context
+            auxiliary = {}
+
+            if LGPSBallStateAux in self.aux_tasks:
+                auxiliary.update(self.ball_state_aux(auxiliary_context))
+
+            if LGPSNextTouchAux in self.aux_tasks:
+                auxiliary['next_touch'] = self.next_touch_aux(player_streams, auxiliary_context)
+
+            return logits, auxiliary, shared
+
         return logits
 
 
 def load_lgps_checkpoint(checkpoint_path, map_location='cpu'):
-    """Load native checkpoints, including older training-only auxiliary objects."""
-    import importlib
     import os
-    import pathlib
-    import sys
-    import types
-    from pathlib import PurePosixPath
+    import pickle
+    from pathlib import PurePosixPath, PureWindowsPath
 
-    legacy_aux_module = None
-    legacy_parent = sys.modules.get('lgps')
-    original_posix_path = pathlib.PosixPath
-    try:
-        try:
-            importlib.import_module('lgps.aux')
-        except ModuleNotFoundError as error:
-            if error.name != 'lgps.aux':
-                raise
-            legacy_aux_module = types.ModuleType('lgps.aux')
-            for class_name in (
-                'LGPSBallStateAux', 'LGPSPlayerStateAux', 'LGPSNextTouchAux',
-            ):
-                legacy_class = type(class_name, (torch.nn.Module,), {})
-                legacy_class.__module__ = 'lgps.aux'
-                setattr(legacy_aux_module, class_name, legacy_class)
-            sys.modules['lgps.aux'] = legacy_aux_module
-            if legacy_parent is not None:
-                legacy_parent.aux = legacy_aux_module
-        if os.name == 'nt':
-            pathlib.PosixPath = PurePosixPath
-        return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
-    finally:
-        pathlib.PosixPath = original_posix_path
-        if legacy_aux_module is not None:
-            sys.modules.pop('lgps.aux', None)
-            if legacy_parent is not None and getattr(legacy_parent, 'aux', None) is legacy_aux_module:
-                del legacy_parent.aux
+    class CheckpointUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            # Training paths in the checkpoint are metadata and may come from another OS.
+            if module == 'pathlib':
+                if os.name == 'nt' and name == 'PosixPath':
+                    return PurePosixPath
+                if os.name != 'nt' and name == 'WindowsPath':
+                    return PureWindowsPath
+            return super().find_class(module, name)
+
+    class CheckpointPickle:
+        Unpickler = CheckpointUnpickler
+        load = staticmethod(pickle.load)
+
+    return torch.load(checkpoint_path, map_location=map_location, weights_only=False,
+                      pickle_module=CheckpointPickle)
 
 
 def lgps_checkpoint_config(checkpoint):
-    """Recover config fields omitted by older checkpoint versions from head shape."""
-    model_config_data = dict(checkpoint['model_config'])
-    model_config_data.setdefault('attention_mode', 'relational')
-    state = {name.removeprefix('_orig_mod.'): value
-             for name, value in checkpoint['model_state_dict'].items()}
-    output_weight = state.get('head.4.weight')
-    if output_weight is not None:
-        output_width = int(output_weight.shape[0])
-        if 'two_way_prediction' not in model_config_data and output_width >= 2:
-            model_config_data['two_way_prediction'] = output_width % 2 == 0
-        if 'horizon_seconds' not in model_config_data:
-            targets_per_team = int(model_config_data.get('targets_per_team', 10))
-            neither_width = int(not model_config_data.get('two_way_prediction', False))
-            if output_width == 2 * targets_per_team + neither_width:
-                model_config_data['horizon_seconds'] = 10.0
-    return LGPSModelConfig(**model_config_data), state
+    return (LGPSModelConfig(**checkpoint['model_config']),
+            checkpoint['model_state_dict'])
 
 
-def load_lgps_weights(model, state):
-    prefixes = ('ball_state_aux.', 'player_state_aux.', 'future_state_aux.', 'next_touch_aux.')
-    # Goal inference does not use auxiliary heads, whose shapes may be tuned per run.
-    inference_state = {name: value for name, value in state.items()
-                       if not name.startswith(prefixes)}
-    if model.config.attention_mode == 'standard':
-        relational_parameters = (
-            'geometry_bias.', 'pad_geometry_bias.', 'pairwise_source.',
-            'pairwise_target.', 'pairwise_source_role.', 'pairwise_target_role.',
-            'pairwise_scale',
-        )
-        inference_state = {
-            name: value for name, value in inference_state.items()
-            if not any(parameter in name for parameter in relational_parameters)
-        }
-    result = model.load_state_dict(inference_state, strict=False)
-    unexpected = list(result.unexpected_keys)
-    missing = [name for name in result.missing_keys if not name.startswith(prefixes)]
-    if unexpected or missing:
-        raise RuntimeError(f'LGPS checkpoint mismatch: missing={missing}, unexpected={unexpected}')
+def load_lgps_weights(model, state, *, include_aux=False):
+    prefixes = ('ball_state_aux.', 'next_touch_aux.')
+    # Goal-only inference can omit auxiliary heads, whose shapes may vary by run.
+    inference_state = dict(state)
+    if not include_aux:
+        inference_state = {name: value for name, value in state.items() if not name.startswith(prefixes)}
+        inference_state.update({name: value for name, value in model.state_dict().items()
+                                if name.startswith(prefixes)})
+    model.load_state_dict(inference_state, strict=True)
 
 
 def lgps_convert_to_onnx(checkpoint_path, output_path=None):
@@ -912,14 +983,11 @@ def lgps_convert_to_onnx(checkpoint_path, output_path=None):
 
     checkpoint = load_lgps_checkpoint(checkpoint_path, map_location='cpu')
     config, state = lgps_checkpoint_config(checkpoint)
-    if checkpoint.get('train_config', {}).get('player_view', False):
-        raise ValueError('Camera-enabled checkpoints require native .pt inference; ONNX export is unsupported')
     model = LGPSTransformer(config).eval()
     load_lgps_weights(model, state)
 
     entities = normalize_model_entities(config.model_entities)
     types = LGPSEntityTokenizer(model_entities=entities).entity_types
-    count = types.numel()
     ball = torch.zeros(2, len(BALL_FEATURES))
     ball[:, :3] = torch.tensor([200.0, -100.0, 300.0])
     players = torch.zeros(2, 6, len(PLAYER_FEATURES))
@@ -927,19 +995,19 @@ def lgps_convert_to_onnx(checkpoint_path, output_path=None):
     players[:, :, PLAYER_FEATURES.index('on_field')] = 1.0
     players[:, :, PLAYER_FEATURES.index('rot_w')] = 1.0
     goals = torch.from_numpy(np.stack((BLUE_GOAL, ORANGE_GOAL))).unsqueeze(0).repeat(2, 1, 1)
-    teams = torch.tensor([[2, 0, 0, 0, 1, 1, 1, 0, 1] + [2] * (count - 9)]).repeat(2, 1)
-    context = torch.tensor([[100.0, 0.0, 1.0, 2.0]]).repeat(2, 1)
+    teams = LGPSEntityTokenizer.entity_teams[model.entity_indices].expand(2, -1).clone()
+    context = torch.tensor([[100.0, 0.0, 0.0, 1.0, 2.0]]).repeat(2, 1)
     arguments = [ball, players, goals, types, teams, context]
     names = ['ball', 'players', 'goals', 'entity_types', 'entity_teams', 'game_context']
 
     if 'big_boosts' in entities:
-        arguments.append(torch.zeros(2, 6, 6))
+        arguments.append(torch.zeros(2, 6, 7))
         names.append('big_boosts')
     elif 'small_boosts' in entities:
         arguments.append(None)
 
     if 'small_boosts' in entities:
-        arguments.append(torch.zeros(2, 28, 6))
+        arguments.append(torch.zeros(2, 28, 7))
         names.append('small_boosts')
 
     # The ONNX exporter currently gives incorrect quadrants for atan2 in
@@ -958,8 +1026,10 @@ def lgps_convert_to_onnx(checkpoint_path, output_path=None):
                          is_causal=False, scale=None):
         scores = query @ key.transpose(-2, -1)
         scores = scores * (scale if scale is not None else query.shape[-1] ** -0.5)
+
         if attn_mask is not None:
             scores = scores + attn_mask
+
         return torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0) @ value
 
     batch = torch.export.Dim('batch', min=1, max=8192)
@@ -968,8 +1038,10 @@ def lgps_convert_to_onnx(checkpoint_path, output_path=None):
                        ['ball', 'players', 'goals', 'entity_types', 'entity_teams',
                         'game_context', 'big_boosts', 'small_boosts'], arguments))
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     for block in model.blocks:
         block.attention.onnx_export = True
+
     try:
         torch.atan2 = export_atan2
         F.scaled_dot_product_attention = export_attention
@@ -980,28 +1052,37 @@ def lgps_convert_to_onnx(checkpoint_path, output_path=None):
     finally:
         torch.atan2 = original_atan2
         F.scaled_dot_product_attention = original_attention
+
         for block in model.blocks:
             block.attention.onnx_export = False
 
     exported_model = onnx.load(output_path)
     metadata = {
+        'sample_rate': json.dumps(config.sample_rate),
+        'model_entities': json.dumps(entities),
         'targets_per_team': str(config.targets_per_team),
         'horizon_seconds': json.dumps(config.horizon_seconds),
         'two_way_prediction': json.dumps(config.two_way_prediction),
+        'has_context_token': json.dumps('context' in entities),
     }
+
     for key, value in metadata.items():
         entry = exported_model.metadata_props.add()
         entry.key = f'lgps.{key}'
         entry.value = value
+
     onnx.save(exported_model, output_path)
     onnx.checker.check_model(exported_model)
     session = ort.InferenceSession(str(output_path), providers=['CPUExecutionProvider'])
+
     for size in (1, 2, 3):
         example = tuple(value if value is None or index == 3 else value[:1].repeat(
             (size,) + (1,) * (value.ndim - 1))
             for index, value in enumerate(arguments))
+
         with torch.inference_mode():
             expected = model(*example).numpy()
+
         argument_names = ('ball', 'players', 'goals', 'entity_types', 'entity_teams',
                           'game_context', 'big_boosts', 'small_boosts')
         feed = {name: value.numpy() for name, value in zip(argument_names, example)
@@ -1023,30 +1104,34 @@ def lgps_convert_to_torchscript(checkpoint_path, output_path=None, device='cpu',
 
     checkpoint = load_lgps_checkpoint(checkpoint_path, map_location='cpu')
     config, state = lgps_checkpoint_config(checkpoint)
-    if checkpoint.get('train_config', {}).get('player_view', False):
-        raise ValueError('Camera-enabled checkpoints require native .pt inference; TorchScript export is unsupported')
     model = LGPSTransformer(config).to(device).eval()
     load_lgps_weights(model, state)
 
     entities = normalize_model_entities(config.model_entities)
     types = LGPSEntityTokenizer(model_entities=entities).entity_types
+
     if batch_size < 1:
         raise ValueError('batch_size must be positive')
+
     batch = batch_size
     arguments = [
         torch.zeros(batch, len(BALL_FEATURES)),
         torch.zeros(batch, 6, len(PLAYER_FEATURES)),
         torch.from_numpy(np.stack((BLUE_GOAL, ORANGE_GOAL))).unsqueeze(0).repeat(batch, 1, 1),
         types,
-        torch.tensor([[2, 0, 0, 0, 1, 1, 1, 0, 1] + [2] * (types.numel() - 9)]).repeat(batch, 1),
-        torch.zeros(batch, 4),
+        LGPSEntityTokenizer.entity_teams[model.entity_indices.cpu()].expand(batch, -1).clone(),
+        torch.zeros(batch, len(CONTEXT_FEATURES)),
     ]
+
     if 'big_boosts' in entities:
-        arguments.append(torch.zeros(batch, 6, 6))
+        arguments.append(torch.zeros(batch, 6, 7))
+
     if 'small_boosts' in entities:
         if 'big_boosts' not in entities:
             raise ValueError('TorchScript export requires big_boosts when small_boosts are configured')
-        arguments.append(torch.zeros(batch, 28, 6))
+
+        arguments.append(torch.zeros(batch, 28, 7))
+
     arguments = [value.to(device) for value in arguments]
 
     # Geometry mask assignments are specialized to this batch size by tracing.
@@ -1059,12 +1144,18 @@ def lgps_convert_to_torchscript(checkpoint_path, output_path=None, device='cpu',
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata = json.dumps({
+        'sample_rate': config.sample_rate,
+        'batch_size': batch_size,
+        'model_entities': entities,
         'targets_per_team': config.targets_per_team,
         'horizon_seconds': config.horizon_seconds,
         'two_way_prediction': config.two_way_prediction,
+        'has_context_token': 'context' in entities,
     })
     torch.jit.save(traced, str(output_path), _extra_files={'lgps_config.json': metadata})
     loaded = torch.jit.load(str(output_path), map_location=device).eval()
+
     with torch.inference_mode():
         torch.testing.assert_close(loaded(*arguments), expected, rtol=1e-4, atol=1e-4)
+
     return output_path

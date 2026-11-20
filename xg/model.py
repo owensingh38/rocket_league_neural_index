@@ -8,19 +8,13 @@ import joblib
 import numpy as np
 import optuna
 import polars as pl
-import re
 import xgboost as xgb
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from scipy import sparse
+from sklearn.metrics import log_loss
 from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    log_loss,
-    roc_auc_score,
-    roc_curve,
-)
 
 from .config import (
     MODEL_FOLDER,
@@ -43,6 +37,7 @@ from .dataset import (
 )
 
 MODEL_FOLDER = str(MODEL_FOLDER)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 DEFAULT_PARAMS = {
     'n_estimators': 400,
@@ -56,7 +51,6 @@ DEFAULT_PARAMS = {
 }
 
 
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 # ANALYZERL XG
 # Trains replay-grouped expected-goals models from labelled frame data.
 
@@ -70,6 +64,8 @@ class AnalyzeRLxG:
         random_state: int = RANDOM_STATE,
         jobs: int | None = None,
         gpu: bool = False,
+        dask_client=None,
+        dask_chunk_rows: int = 65536,
     ) -> None:
         # Initialize a binary XGBoost classifier for shot-goal labels.
         model_params = {**DEFAULT_PARAMS, **dict(params or {})}
@@ -83,6 +79,8 @@ class AnalyzeRLxG:
         })
         self.params = model_params
         self.model = xgb.XGBClassifier(**model_params)
+        self.dask_client = dask_client
+        self.dask_chunk_rows = int(dask_chunk_rows)
 
     def fit(
         self,
@@ -93,6 +91,91 @@ class AnalyzeRLxG:
         early_stopping_rounds: int = 50,
     ) -> AnalyzeRLxG:
         # Validation folds own early stopping; the final refit uses the selected tree count.
+        if self.dask_client is not None:
+            import dask.array as da
+            from dask import delayed
+            from xgboost import dask as dxgb
+
+            def distributed_array(values, *, labels=False):
+                rows = values.shape[0]
+                workers = sorted(self.dask_client.scheduler_info()['workers'])
+                worker_count = max(1, len(workers))
+                target_rows_per_worker = max(
+                    1, (rows + worker_count - 1) // worker_count,
+                )
+                chunk_rows = min(
+                    max(1, self.dask_chunk_rows),
+                    target_rows_per_worker,
+                )
+                blocks = []
+
+                def keep_block(block):
+                    return block
+
+                for block_number, start in enumerate(range(0, rows, chunk_rows)):
+                    end = min(start + chunk_rows, rows)
+                    block = values[start:end]
+                    worker = workers[block_number % worker_count]
+                    future = self.dask_client.scatter(
+                        block,
+                        workers=[worker],
+                        broadcast=False,
+                        hash=False,
+                    )
+                    block_shape = (end - start,) if labels else (
+                        end - start,
+                        values.shape[1],
+                    )
+                    block_meta = None if labels else sparse.csr_matrix(
+                        (0, values.shape[1]), dtype=values.dtype,
+                    )
+                    delayed_block = delayed(keep_block, pure=False)(future)
+                    blocks.append(da.from_delayed(
+                        delayed_block,
+                        shape=block_shape,
+                        dtype=values.dtype,
+                        meta=block_meta,
+                    ))
+
+                return da.concatenate(blocks, axis=0)
+
+            dask_matrix = distributed_array(matrix)
+            dask_labels = distributed_array(labels, labels=True)
+            dask_eval_set = None
+
+            if valid_matrix is not None and valid_labels is not None:
+                dask_eval_set = [(
+                    distributed_array(valid_matrix),
+                    distributed_array(valid_labels, labels=True),
+                )]
+
+            distributed_model = dxgb.DaskXGBClassifier(**self.params)
+            distributed_model.client = self.dask_client
+
+            if dask_eval_set is not None:
+                distributed_model.set_params(
+                    early_stopping_rounds=int(early_stopping_rounds)
+                )
+                distributed_model.fit(
+                    dask_matrix,
+                    dask_labels,
+                    eval_set=dask_eval_set,
+                    verbose=False,
+                )
+            else:
+                distributed_model.set_params(early_stopping_rounds=None)
+                distributed_model.fit(dask_matrix, dask_labels, verbose=False)
+
+            # Persist a normal sklearn-compatible estimator for local inference.
+            self.model = xgb.XGBClassifier(**self.params)
+            self.model.set_params(device='cpu')
+            self.model._Booster = distributed_model.get_booster()
+            self.model._Booster.set_param({'device': 'cpu'})
+            self.model.n_classes_ = 2
+            self.dask_client = None
+            del distributed_model, dask_matrix, dask_labels, dask_eval_set
+            return self
+
         if valid_matrix is not None and valid_labels is not None:
             self.model.set_params(early_stopping_rounds=int(early_stopping_rounds))
             self.model.fit(
@@ -104,6 +187,7 @@ class AnalyzeRLxG:
         else:
             self.model.set_params(early_stopping_rounds=None)
             self.model.fit(matrix, labels, verbose=False)
+
         return self
 
     def predict_proba(self, matrix: sparse.csr_matrix) -> np.ndarray:
@@ -126,9 +210,11 @@ def _grouped_split(labels: np.ndarray, groups: np.ndarray, train_pct: float, see
     # Replay groups cannot cross the train/test boundary without leaking game state.
     rows = np.arange(len(labels))
     splitter = GroupShuffleSplit(n_splits=50, train_size=train_pct, random_state=seed)
+
     for train_idx, test_idx in splitter.split(rows, labels, groups):
         if len(np.unique(labels[train_idx])) == 2 and len(np.unique(labels[test_idx])) == 2:
             return train_idx, test_idx
+
     raise ValueError('Could not create a replay-grouped train/test split containing both outcomes')
 
 
@@ -151,14 +237,17 @@ def _suggest_params(trial: optuna.Trial, fixed: Mapping[str, Any]) -> dict[str, 
         'reg_alpha': lambda: trial.suggest_float('reg_alpha', 1e-5, 50.0, log=True),
         'max_bin': lambda: trial.suggest_categorical('max_bin', [128, 256, 384, 512, 768]),
     }
+
     for name, suggest in suggestions.items():
         if name not in params:
             params[name] = suggest()
+
     return params
 
 
 def _study_results(study: optuna.Study) -> pl.DataFrame:
     records = []
+
     for trial in study.trials:
         records.append({
             'iteration': trial.number,
@@ -169,6 +258,7 @@ def _study_results(study: optuna.Study) -> pl.DataFrame:
             'state': trial.state.name,
             'params': trial.user_attrs.get('params', json.dumps(trial.params, sort_keys=True)),
         })
+
     return pl.DataFrame(records) if records else pl.DataFrame({
         'iteration': [], 'mean_log_loss': [], 'std_log_loss': [],
         'mean_best_iteration': [], 'completed_folds': [], 'state': [], 'params': [],
@@ -188,14 +278,19 @@ def _cross_validate(
     early_stopping_rounds: int,
     cv_path: Path,
     segment: str,
+    dask_client=None,
+    dask_chunk_rows: int = 65536,
 ) -> tuple[dict[str, Any], pl.DataFrame]:
     class_counts = np.bincount(labels.astype(np.int8), minlength=2)
     positive_groups = len(np.unique(groups[labels == 1]))
     negative_groups = len(np.unique(groups[labels == 0]))
     splits = min(cv, int(class_counts.min()), positive_groups, negative_groups)
+
     if splits < 2:
         raise ValueError('Replay-grouped cross-validation requires at least two replay groups per outcome')
+
     folds = None
+
     for fold_count in range(splits, 1, -1):
         candidates = list(
             StratifiedGroupKFold(
@@ -210,18 +305,22 @@ def _cross_validate(
             and not set(groups[train_idx]).intersection(groups[valid_idx])
             for train_idx, valid_idx in candidates
         )
+
         if valid_folds:
             splits = fold_count
             folds = candidates
             break
+
     if folds is None:
         raise ValueError('Could not form replay-grouped CV folds containing both outcomes')
+
     fixed_params = dict(params or {})
 
     def evaluate(candidate, iteration, trial=None):
         # Each validation fold owns early stopping and contributes its best tree count.
         losses = []
         best_iterations = []
+
         for fold_number, (train_idx, valid_idx) in enumerate(folds, start=1):
             print(
                 f'[{segment}] trial {iteration + 1}: fold {fold_number}/{splits}',
@@ -229,7 +328,11 @@ def _cross_validate(
             )
             fold_train = matrix[train_idx]
             fold_valid = matrix[valid_idx]
-            model = AnalyzeRLxG(candidate, seed + iteration, jobs, gpu).fit(
+            model = AnalyzeRLxG(
+                candidate, seed + iteration, jobs, gpu,
+                dask_client=dask_client,
+                dask_chunk_rows=dask_chunk_rows,
+            ).fit(
                 fold_train,
                 labels[train_idx],
                 fold_valid,
@@ -240,13 +343,16 @@ def _cross_validate(
             losses.append(log_loss(labels[valid_idx], predictions, labels=[0, 1]))
             best_iterations.append(model.best_iteration_)
             del model, fold_train, fold_valid, predictions
+
             if trial is not None:
                 trial.set_user_attr('completed_folds', fold_number)
                 trial.report(float(np.mean(losses)), step=fold_number)
+
                 if trial.should_prune():
                     trial.set_user_attr('std_log_loss', float(np.std(losses)))
                     trial.set_user_attr('mean_best_iteration', int(np.mean(best_iterations)))
                     raise optuna.TrialPruned()
+
         return losses, best_iterations
 
     if n_iters == 0:
@@ -307,99 +413,6 @@ def _cross_validate(
     return best_params, _study_results(study)
 
 
-def _write_evaluation(
-    output: Path,
-    segment: str,
-    model: AnalyzeRLxG,
-    feature_columns: Sequence[str],
-    shap_matrix: np.ndarray,
-    labels: np.ndarray,
-    predictions: np.ndarray,
-):
-    import matplotlib.pyplot as plt
-
-    import shap
-
-    contributions = model.model.get_booster().predict(
-        xgb.DMatrix(shap_matrix, feature_names=list(feature_columns)),
-        pred_contribs=True,
-    )
-    shap_values = np.asarray(contributions[:, :-1], dtype=np.float32)
-    np.save(output / f'shap_values_{segment}.npy', shap_values)
-
-    shap.summary_plot(
-        shap_values,
-        shap_matrix,
-        feature_names=list(feature_columns),
-        max_display=25,
-        show=False,
-    )
-    plt.gcf().set_size_inches(10, 8)
-    plt.xlabel('SHAP Value (Impact on Model Output)')
-    plt.ylabel('Feature')
-    plt.gcf().axes[-1].set_ylabel('Feature Value')
-    plt.title(f'AnalyzeRL xG SHAP Summary ({segment.title()})')
-    plt.tight_layout()
-    plt.savefig(output / f'shap_summary_{segment}.png', dpi=160)
-    plt.close()
-
-    dependence_dir = output / 'dependence'
-    dependence_dir.mkdir(parents=True, exist_ok=True)
-    used_names = set()
-    for feature_index, feature in enumerate(feature_columns):
-        feature_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(feature)).strip('._')
-        feature_name = feature_name or f'feature_{feature_index}'
-        if feature_name in used_names:
-            feature_name = f'{feature_name}_{feature_index}'
-        used_names.add(feature_name)
-        shap.dependence_plot(
-            feature_index,
-            shap_values,
-            shap_matrix,
-            feature_names=list(feature_columns),
-            interaction_index=feature,
-            show=False,
-            alpha=0.6,
-        )
-        plt.gcf().set_size_inches(7, 5)
-        plt.title(f'{segment.title()} SHAP Dependence: {feature}')
-        plt.tight_layout()
-        plt.savefig(dependence_dir / f'dependence_{segment}_{feature_name}.png', dpi=120)
-        plt.close()
-
-    false_positive, true_positive, _ = roc_curve(labels, predictions)
-    auc = roc_auc_score(labels, predictions)
-    plt.figure(figsize=(8, 7))
-    plt.plot(false_positive, true_positive, label=f'AUC = {auc:.4f}', color='#2f6f73')
-    plt.plot([0, 1], [0, 1], '--', color='#777777')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'AnalyzeRL xG ROC Curve ({segment.title()})')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output / f'roc_auc_{segment}.png', dpi=160)
-    plt.close()
-
-    bins = np.linspace(0.0, 1.0, 11)
-    bin_ids = np.clip(np.digitize(predictions, bins) - 1, 0, len(bins) - 2)
-    predicted, observed = [], []
-    for bin_id in range(len(bins) - 1):
-        mask = bin_ids == bin_id
-        if np.any(mask):
-            predicted.append(float(np.mean(predictions[mask])))
-            observed.append(float(np.mean(labels[mask])))
-    plt.figure(figsize=(8, 7))
-    plt.plot(predicted, observed, 's-', color='#2f6f73', label=segment)
-    plt.plot([0, 1], [0, 1], '--', color='#777777', label='Perfect calibration')
-    plt.xlabel('Mean Predicted Probability')
-    plt.ylabel('Observed Goal Rate')
-    plt.title(f'AnalyzeRL xG Calibration Curve ({segment.title()})')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output / f'calibration_{segment}.png', dpi=160)
-    plt.close()
-
-
 def _train_segment(
     frames: pl.DataFrame,
     segment: str,
@@ -413,29 +426,39 @@ def _train_segment(
     gpu: bool,
     early_stopping_rounds: int,
     prepared: bool = False,
-    include_prior_event_history: bool = False,
     test_frames: pl.DataFrame | None = None,
+    dask_client=None,
+    dask_chunk_rows: int = 65536,
 ) -> dict[str, Any]:
-    features = frames if prepared else prepare_model_data(
-        frames,
-        include_prior_event_history=include_prior_event_history,
+    from .evaluate import evaluate_xg_model
+
+    features = prepare_model_data(frames) if not prepared else frames.drop(
+        [
+            column for column in frames.columns
+            if column.startswith(('history_', 'off_', 'pass_', 'passer_'))
+            or column.endswith('_scaled')
+            or column in {'shooter_team_has_possession', 'shooter_team_possession_length'}
+        ],
+        strict=False,
     )
     labels = features['is_goal'].to_numpy().astype(np.int8)
     groups = features['replay_id'].to_numpy()
+
     if features.height < 20 or len(np.unique(labels)) < 2:
         raise ValueError(f'{segment} does not contain enough shot outcomes to train')
-    test_features = None if test_frames is None else prepare_model_data(
-        test_frames,
-        include_prior_event_history=include_prior_event_history,
-    )
+
+    test_features = None if test_frames is None else prepare_model_data(test_frames)
+
     if test_features is None:
         train_idx, test_idx = _grouped_split(labels, groups, train_test_split_pct, seed)
     else:
         train_idx = np.arange(features.height)
         test_idx = np.arange(test_features.height)
         overlap = set(groups).intersection(test_features['replay_id'].to_list())
+
         if overlap:
             raise ValueError(f'{segment} train/test replay leakage: {len(overlap)} overlapping replays')
+
     candidate_columns = [
         column for column in features.columns
         if column not in {'replay_id', 'event_id', 'is_goal', 'model_segment'}
@@ -465,9 +488,14 @@ def _train_segment(
         early_stopping_rounds,
         cv_path,
         segment,
+        dask_client,
+        dask_chunk_rows,
     )
-    model = AnalyzeRLxG(best_params, seed, jobs, gpu).fit(train_matrix, labels[train_idx])
-    predictions = model.predict_proba(test_matrix)[:, 1]
+    model = AnalyzeRLxG(
+        best_params, seed, jobs, gpu,
+        dask_client=dask_client,
+        dask_chunk_rows=dask_chunk_rows,
+    ).fit(train_matrix, labels[train_idx])
     test_eval_features = features[test_idx] if test_features is None else test_features
     test_labels = (
         labels[test_idx] if test_features is None
@@ -480,14 +508,8 @@ def _train_segment(
     shap_matrix = _feature_matrix(test_eval_features, feature_columns)
     column_classes = _feature_column_classes(feature_columns)
     cv_results.write_csv(cv_path)
-    _write_evaluation(
-        output,
-        segment,
-        model,
-        feature_columns,
-        shap_matrix,
-        test_labels,
-        predictions,
+    evaluation_metrics = evaluate_xg_model(
+        model, test_matrix, test_labels, output, segment, feature_columns, shap_matrix,
     )
     metrics = {
         'segment': segment,
@@ -512,22 +534,102 @@ def _train_segment(
         'search_iterations': n_iters,
         'early_stopping_rounds': early_stopping_rounds,
         'cv_strategy': 'stratified_group',
-        'test_log_loss': float(log_loss(test_labels, predictions, labels=[0, 1])),
-        'test_brier': float(brier_score_loss(test_labels, predictions)),
-        'test_roc_auc': float(roc_auc_score(test_labels, predictions)),
-        'test_average_precision': float(average_precision_score(test_labels, predictions)),
+        **evaluation_metrics,
         'best_params': {**DEFAULT_PARAMS, **best_params},
     }
+
     with (output / f'metrics_{segment}.json').open('w', encoding='utf-8') as handle:
         json.dump(metrics, handle, indent=2)
+
     joblib.dump({
         'model': model,
         'feature_columns': feature_columns,
         'column_classes': column_classes,
         'model_segment': segment,
-        'include_prior_event_history': include_prior_event_history,
     }, output / f'xg_model_{segment}.joblib')
     return metrics
+
+
+@contextmanager
+def _dask_client_session(runtime_config: XGRuntimeConfig):
+    try:
+        from distributed import Client, LocalCluster
+    except ImportError as error:
+        raise ImportError(
+            "Dask training requires `dask[distributed]`; install the project requirements."
+        ) from error
+
+    cluster = None
+    client = None
+
+    try:
+        if runtime_config.dask_scheduler_address:
+            client = Client(runtime_config.dask_scheduler_address)
+
+            if runtime_config.dask_workers is not None:
+                client.wait_for_workers(runtime_config.dask_workers)
+        else:
+            gpu = runtime_config.gpu
+
+            if gpu is None:
+                try:
+                    import torch
+                    gpu = torch.cuda.is_available()
+                except ImportError:
+                    gpu = False
+
+            if gpu:
+                try:
+                    from dask_cuda import LocalCUDACluster
+                except ImportError as error:
+                    raise ImportError(
+                        "A local multi-GPU Dask cluster requires dask-cuda. "
+                        "Install a dask-cuda build compatible with your CUDA/RAPIDS stack, "
+                        "or provide dask_scheduler_address for an existing cluster."
+                    ) from error
+
+                import torch
+                workers = runtime_config.dask_workers or torch.cuda.device_count()
+
+                if workers < 2:
+                    raise ValueError(
+                        "Dask multi-GPU training needs at least two visible GPUs; "
+                        "set dask_scheduler_address to use a remote GPU cluster."
+                    )
+
+                cluster = LocalCUDACluster(
+                    n_workers=workers,
+                    threads_per_worker=1,
+                    dashboard_address=None,
+                )
+            else:
+                workers = runtime_config.dask_workers or 2
+
+                if workers < 2:
+                    raise ValueError("Dask training requires at least two workers")
+
+                cluster = LocalCluster(
+                    n_workers=workers,
+                    threads_per_worker=max(1, runtime_config.jobs or 1),
+                    dashboard_address=None,
+                )
+
+            client = Client(cluster)
+
+        worker_count = len(client.scheduler_info().get('workers', {}))
+
+        if worker_count < 2:
+            raise RuntimeError(
+                f"Dask xG training requires at least two active workers; found {worker_count}"
+            )
+
+        yield client
+    finally:
+        if client is not None:
+            client.close()
+
+        if cluster is not None:
+            cluster.close()
 
 
 def analyzerl_xg(
@@ -543,7 +645,6 @@ def analyzerl_xg(
     params: Mapping[str, Any] | None = None,
     random_state: int = RANDOM_STATE,
     gpu: bool | None = None,
-    include_event_context: bool = False,
     early_stopping_rounds: int = 50,
     train_config: XGTrainConfig | None = None,
     model_config: XGModelConfig | None = None,
@@ -553,8 +654,26 @@ def analyzerl_xg(
     test_replay_ids: Sequence[str] | None = None,
     train_frame_paths: Sequence[str | Path] | Mapping[str, Sequence[str | Path]] | None = None,
     test_frame_paths: Sequence[str | Path] | Mapping[str, Sequence[str | Path]] | None = None,
+    _dask_client=None,
 ) -> pl.DataFrame:
     # Train and evaluate an xG model for each requested replay segment.
+    if runtime_config is not None and runtime_config.dask and _dask_client is None:
+        if runtime_config.dask_chunk_rows <= 0:
+            raise ValueError('dask_chunk_rows must be a positive integer')
+
+        with _dask_client_session(runtime_config) as client:
+            worker_count = len(client.scheduler_info().get('workers', {}))
+            print(f"Dask xG training connected to {worker_count} worker(s)", flush=True)
+            call_args = locals()
+            recursive_args = {
+                name: call_args[name]
+                for name in analyzerl_xg.__code__.co_varnames[
+                    :analyzerl_xg.__code__.co_argcount
+                ]
+            }
+            recursive_args['_dask_client'] = client
+            return analyzerl_xg(**recursive_args)
+
     if train_config is not None:
         frames_folder = train_config.frames_folder
         test_frames_folder = train_config.test_frames_folder
@@ -566,31 +685,41 @@ def analyzerl_xg(
         n_iters = train_config.search_iterations
         train_test_split_pct = train_config.train_test_split_pct
         early_stopping_rounds = train_config.early_stopping_rounds
-        include_event_context = train_config.include_prior_event_history
+
     if model_config is not None:
         if model_config.model_params is not None:
             params = model_config.model_params
+
         random_state = model_config.random_state
+
     if runtime_config is not None:
         jobs = runtime_config.jobs
         gpu = runtime_config.gpu
+
     if gpu is None:
         try:
             import torch
             gpu = torch.cuda.is_available()
         except ImportError:
             gpu = False
+
     segments = _normalize_segments(model_segments)
+
     if not 0.0 < train_test_split_pct < 1.0:
         raise ValueError('train_test_split_pct must be strictly between 0 and 1')
+
     if cv < 2:
         raise ValueError('cv must be at least 2')
+
     if n_iters < 0:
         raise ValueError('n_iters cannot be negative')
+
     if early_stopping_rounds <= 0:
         raise ValueError('early_stopping_rounds must be a positive integer')
+
     print('Training RL xG model(s)...', flush=True)
     results = []
+
     for segment in segments:
         # Load, train, and release one mode before scanning data for the next mode.
         prepared = training_parquet is not None
@@ -604,6 +733,7 @@ def analyzerl_xg(
             if isinstance(test_frame_paths, Mapping)
             else test_frame_paths
         )
+
         if prepared:
             segment_frames = load_training_parquet(
                 training_parquet,
@@ -617,25 +747,28 @@ def analyzerl_xg(
                 segment,
                 limit,
                 random_state,
-                include_event_context,
                 frame_paths=None if segment_train_paths is None else [Path(path) for path in segment_train_paths],
                 selected_replay_ids=train_replay_ids,
             )
+
         test_segment_frames = None
+
         if test_frames_folder is not None:
             test_segment_frames = load_segment_training_frames(
                 test_frames_folder,
                 segment,
                 limit,
                 random_state,
-                include_event_context,
                 frame_paths=None if segment_test_paths is None else [Path(path) for path in segment_test_paths],
                 selected_replay_ids=test_replay_ids,
             )
+
         if segment_frames.is_empty():
             continue
+
         if test_segment_frames is not None and test_segment_frames.is_empty():
             raise ValueError(f'{segment} has no shot events in the configured LGPS test source')
+
         try:
             results.append(_train_segment(
                 segment_frames,
@@ -650,16 +783,24 @@ def analyzerl_xg(
                 gpu,
                 early_stopping_rounds,
                 prepared,
-                include_event_context,
                 test_segment_frames,
+                dask_client=_dask_client,
+                dask_chunk_rows=(
+                    runtime_config.dask_chunk_rows
+                    if runtime_config is not None else 65536
+                ),
             ))
         finally:
             del segment_frames
+
             if test_segment_frames is not None:
                 del test_segment_frames
+
             gc.collect()
+
     if not results:
         raise ValueError('No shot events matched the requested model_segments')
+
     print('Finished RL xG Model(s).', flush=True)
     return pl.DataFrame(results)
 
@@ -668,6 +809,5 @@ if __name__ == '__main__':
     analyzerl_xg(
         n_iters=20,
         model_segments=MODEL_SEGMENTS,
-        include_event_context=True,
         jobs=2
     )

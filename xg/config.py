@@ -1,10 +1,12 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from shared import DATA_DIR
 
-FRAMES_FOLDER = Path("../data/frames/rlcs/x")
-TEST_FRAMES_FOLDER = Path("../data/frames/rlcs/2026")
-MODEL_FOLDER = Path("models/xg")
+ROOT = Path(__file__).resolve().parents[1]
+FRAMES_FOLDER = ROOT / DATA_DIR / "frames" / "x"
+TEST_FRAMES_FOLDER = ROOT / DATA_DIR / "frames" / "2026"
+MODEL_FOLDER = ROOT / "results" / "xg"
 MODEL_SEGMENTS = ("duels", "doubles", "standard")
 
 @dataclass(frozen=True)
@@ -24,12 +26,16 @@ class XGTrainConfig:
     search_iterations: int = 30
     train_test_split_pct: float = 0.8
     early_stopping_rounds: int = 50
-    include_prior_event_history: bool = False
 
 @dataclass(frozen=True)
 class XGRuntimeConfig:
     jobs: int | None = None
     gpu: bool | None = None
+    # Distribute XGBoost CV and final fits through xgboost.dask.
+    dask: bool = False
+    dask_scheduler_address: str | None = None
+    dask_workers: int | None = None
+    dask_chunk_rows: int = 65536
 
 DEFAULT_MODEL_CONFIG = XGModelConfig()
 DEFAULT_TRAIN_CONFIG = XGTrainConfig()

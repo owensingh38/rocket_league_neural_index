@@ -11,8 +11,8 @@ requires-python = ">=3.10"
 dynamic = ["dependencies"]
 
 [tool.setuptools]
-packages = ["lgps", "xg", "inference"]
-py-modules = ["props"]
+packages = ["lgps", "xg"]
+py-modules = ["shared"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
